@@ -14,8 +14,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .images import normalize
-from .pipeline import Interrupted, export, process
+from .captions import blocks
+from .images import duplicate, fingerprints, normalize
+from .pipeline import Interrupted, existing_image, export, process, retry_image
 from .research import CATEGORIES, session
 from .script import (MAX_HOOK, SCENE_COUNT, estimated_seconds, scene_counts,
                      validate_scenes, word_range)
@@ -161,16 +162,16 @@ class Window(QMainWindow):
         form.addRow("Assunto personalizado", self.topic)
         form.addRow("Voz", self.voice)
         page.addLayout(form)
-        self.automatic = self.button("Gerar vídeo automaticamente", lambda: self.start_new("Vídeo"), page, True)
+        self.automatic = self.button("Gerar roteiro e preparar imagens", lambda: self.start_new("Vídeo"), page, True)
         self.script_only = self.button("Criar roteiro para revisar", lambda: self.start_new("Roteiro"), page)
         page.addSpacing(14)
         self.current = QLabel()
         self.current.setWordWrap(True)
         self.current.setTextFormat(Qt.TextFormat.PlainText)
         page.addWidget(self.current)
-        self.resume = self.button("Produzir ou retomar projeto", self.resume_project, page)
+        self.resume = self.button("Preparar ou rever cenas", self.resume_project, page)
         self.stop = self.button("Interromper e salvar", self.stop_task, page)
-        self.export_button = self.button("Exportar MP4, legendas e créditos", self.export_project, page)
+        self.export_button = self.button("Exportar MP4, SRT, ASS e créditos", self.export_project, page)
         page.addStretch()
 
     def editor(self):
@@ -200,9 +201,54 @@ class Window(QMainWindow):
         self.images = QListWidget()
         self.images.setIconSize(QSize(72, 100))
         self.images.setAccessibleName("Imagens e atribuições por cena")
-        self.images.currentRowChanged.connect(lambda index: self.update_controls())
-        page.addWidget(self.images, 1)
-        self.replace = self.button("Substituir imagem selecionada", self.replace_image, page)
+        self.images.currentRowChanged.connect(self.show_scene)
+        self.images.itemDoubleClicked.connect(self.preview_image)
+        page.addWidget(self.images, 2)
+        self.scene_details = QPlainTextEdit(readOnly=True)
+        self.scene_details.setAccessibleName("Narração, consultas e prévia de legendas")
+        page.addWidget(self.scene_details, 1)
+        actions = QHBoxLayout()
+        self.retry = self.button("Buscar outra imagem", self.find_image, actions)
+        self.replace = self.button("Selecionar imagem local", self.replace_image, actions)
+        page.addLayout(actions)
+        self.render_button = self.button("Renderizar cenas revisadas",
+                                         lambda: self.start_project("Renderizar"), page, True)
+
+    def show_scene(self, row):
+        if row < 0 or not self.project:
+            self.scene_details.clear()
+        else:
+            scene = self.project["scenes"][row]
+            image = scene.get("image", {})
+            queries = " · ".join(scene.get("keywords") or [scene["query"]])
+            captions = "\n\n".join("\n".join(lines) for lines in blocks(scene["text"]))
+            self.scene_details.setPlainText(
+                f'Narração: {scene["text"]}\nConsultas: {queries}\n'
+                f'Provedor: {image.get("provider", "Pendente")}\n'
+                f'Consulta utilizada: {image.get("search_query", "—")}\n\n'
+                f"Prévia dos blocos de legenda\n{captions}"
+            )
+        self.update_controls()
+
+    def preview_image(self):
+        row = self.images.currentRow()
+        if row < 0:
+            return
+        image = self.project["scenes"][row].get("image")
+        if not image:
+            return
+        path = self.store.folder(self.project) / image["file"]
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Imagem da cena {row + 1}")
+        layout = QVBoxLayout(dialog)
+        label = QLabel()
+        label.setPixmap(pixmap.scaled(560, 580, Qt.AspectRatioMode.KeepAspectRatio,
+                                      Qt.TransformationMode.SmoothTransformation))
+        layout.addWidget(label)
+        dialog.exec()
 
     def history_page(self):
         page = self.page("Histórico")
@@ -282,6 +328,7 @@ class Window(QMainWindow):
             item = QListWidgetItem(f'{title}  ·  {project["status"]}')
             item.setData(Qt.ItemDataRole.UserRole, project["id"])
             self.history.addItem(item)
+        selected_row = self.images.currentRow()
         self.images.clear()
         self.script_text.clear()
         self.sources.clear()
@@ -306,8 +353,9 @@ class Window(QMainWindow):
                                                         image.get("license_url"), *image.get("notes", [])))))
                 if image:
                     pixmap = QPixmap(str(self.store.folder(project) / image["file"]))
-                    item.setIcon(QIcon(pixmap.scaled(72, 100, Qt.AspectRatioMode.KeepAspectRatio,
-                                                     Qt.TransformationMode.SmoothTransformation)))
+                    if not pixmap.isNull():
+                        item.setIcon(QIcon(pixmap.scaled(72, 100, Qt.AspectRatioMode.KeepAspectRatio,
+                                                         Qt.TransformationMode.SmoothTransformation)))
                 self.images.addItem(item)
             metadata = "\n".join(project.get(field, "") for field in ("title", "description", "hashtags"))
             self.sources.setPlainText(metadata.strip() + "\n\n" + "\n\n".join(sources))
@@ -319,6 +367,8 @@ class Window(QMainWindow):
         self.script_text.document().setModified(False)
         self.update_script_metrics()
         self.update_controls()
+        if self.images.count():
+            self.images.setCurrentRow(max(0, min(selected_row, self.images.count() - 1)))
 
     def editor_lines(self):
         lines = [line.strip() for line in self.script_text.toPlainText().split("\n")]
@@ -350,7 +400,13 @@ class Window(QMainWindow):
         self.export_button.setEnabled(idle and has_project and self.project["status"] == "Pronto")
         self.save_script_button.setEnabled(idle and has_scenes)
         self.script_text.setReadOnly(not (idle and has_scenes))
-        self.replace.setEnabled(idle and has_scenes and self.images.currentRow() >= 0)
+        selected = idle and has_scenes and self.images.currentRow() >= 0
+        self.replace.setEnabled(selected)
+        self.retry.setEnabled(selected and not review)
+        self.render_button.setEnabled(idle and has_scenes and not review
+                                      and all(scene.get("image") and not scene["image"].get("placeholder")
+                                              and scene["image"].get("provider") != "Cartão gráfico"
+                                              for scene in self.project["scenes"]))
         self.open_button.setEnabled(idle and self.history.currentRow() >= 0)
 
     def save_script(self):
@@ -368,6 +424,7 @@ class Window(QMainWindow):
                 if scene["text"] != text:
                     scene["text"] = text
                     scene["edited"] = True
+                    scene.pop("keywords", None)
             project["status"] = "Revisão pendente" if project.get("script_review") else "Roteiro editado"
             self.store.save(project)
             self.project = project
@@ -412,8 +469,21 @@ class Window(QMainWindow):
             self.refresh()
             self.nav.setCurrentRow(1 if self.project["scenes"] else 0)
 
+    def find_image(self):
+        row = self.images.currentRow()
+        if not self.save_script():
+            return
+        project = copy.deepcopy(self.project)
+        config = self.get_config()
+        def operation(progress, check):
+            progress(20, f"Buscando alternativa para a cena {row + 1}")
+            return retry_image(self.store, project, config, row, progress, check)
+        self.execute(operation, project["id"], 2)
+
     def replace_image(self):
         row = self.images.currentRow()
+        if not self.save_script():
+            return
         filename, _ = QFileDialog.getOpenFileName(self, "Selecionar imagem", filter="Imagens (*.jpg *.jpeg *.png *.webp)")
         if not filename:
             return
@@ -444,6 +514,12 @@ class Window(QMainWindow):
         def import_image(progress, check):
             normalize(filename, folder / target)
             check()
+            credit.update(fingerprints(folder / target))
+            existing = [image for index, scene in enumerate(project["scenes"]) if index != row
+                        if (image := existing_image(scene, folder))]
+            if duplicate(credit, existing):
+                (folder / target).unlink()
+                raise ValueError("Esta imagem é igual ou muito semelhante à de outra cena.")
             project["scenes"][row]["image"] = credit
             project["status"] = "Revisão pendente" if project.get("script_review") else "Visual editado"
             self.store.save(project)
@@ -451,11 +527,13 @@ class Window(QMainWindow):
         self.execute(import_image, project["id"])
 
     def start_project(self, mode):
+        if mode == "Renderizar" and not self.save_script():
+            return
         project = copy.deepcopy(self.project)
         config = self.get_config()
         def operation(progress, check):
             process(self.store, project, config, mode, progress, check)
-        self.execute(operation, project["id"], 1 if mode == "Roteiro" else None)
+        self.execute(operation, project["id"], {"Roteiro": 1, "Vídeo": 2}.get(mode))
 
     def execute(self, operation, work_id=None, desired_page=None, export_job=False):
         self.work_id = work_id

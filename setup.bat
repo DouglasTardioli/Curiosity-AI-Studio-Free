@@ -25,6 +25,7 @@ if errorlevel 1 (
 )
 where ffmpeg >nul 2>&1 || goto :no_ffmpeg
 where ffprobe >nul 2>&1 || goto :no_ffmpeg
+ffmpeg -hide_banner -filters 2>nul | findstr /L /C:" ass " >nul || goto :no_ffmpeg
 
 if exist "%LOCALAPPDATA%\Programs\Ollama\ollama.exe" set "PATH=%PATH%;%LOCALAPPDATA%\Programs\Ollama"
 where ollama >nul 2>&1
@@ -55,7 +56,7 @@ exit /b 0
 echo Instale Python 3.12 com o Python Launcher e execute o setup novamente.
 goto :failed
 :no_ffmpeg
-echo Instale FFmpeg e FFprobe, adicione os executaveis ao PATH e execute o setup novamente.
+echo Instale FFmpeg com libass e FFprobe, adicione os executaveis ao PATH e execute o setup novamente.
 goto :failed
 :no_ollama
 echo Instale e abra o Ollama para Windows e execute o setup novamente.

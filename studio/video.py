@@ -1,80 +1,69 @@
-import json
+import shutil
 import textwrap
 import wave
-from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from .tools import probe, run
-from .voice import SAMPLE_RATE, subtitles
+from .captions import FONT, ass, scene_cues, srt
+from .voice import SAMPLE_RATE
 
 WIDTH, HEIGHT, FPS = 1080, 1920, 30
 
-def overlay(path, text, image):
-    canvas = Image.new("RGBA", (WIDTH, HEIGHT))
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default(size=52)
-    lines = []
-    line = ""
-    for word in text.split():
-        candidate = f"{line} {word}".strip()
-        if line and draw.textlength(candidate, font=font) > 850:
-            lines.append(line)
-            line = word
-        else:
-            line = candidate
-    lines.append(line)
-    caption = "\n".join(lines)
-    top = 1510 - len(lines) * 33
-    bounds = draw.multiline_textbbox((540, top), caption, font=font, anchor="ma",
-                                    align="center", spacing=12)
-    draw.rounded_rectangle((bounds[0]-28, bounds[1]-18, bounds[2]+28, bounds[3]+18),
-                           radius=24, fill=(9, 15, 26, 229))
-    draw.multiline_text((540, top), caption, font=font, fill="white", anchor="ma",
-                        align="center", spacing=12)
-    credit = " · ".join(filter(None, (image.get("author"), image.get("provider"))))
-    if credit:
-        small = ImageFont.load_default(size=26)
-        credit = textwrap.shorten(credit, width=65, placeholder="…")
-        draw.text((540, 1685), credit, anchor="mm", font=small, fill="white",
-                  stroke_width=3, stroke_fill="#141923")
-    canvas.save(path)
+def compose(original):
+    source = ImageOps.exif_transpose(original).convert("RGB")
+    if abs(source.width / source.height - WIDTH / HEIGHT) <= 0.10:
+        return ImageOps.fit(source, (WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    backdrop = ImageOps.fit(source, (WIDTH // 4, HEIGHT // 4))
+    backdrop = backdrop.filter(ImageFilter.GaussianBlur(14)).resize((WIDTH, HEIGHT))
+    backdrop = ImageEnhance.Brightness(backdrop).enhance(0.62)
+    foreground = ImageOps.contain(source, (930, 1680), Image.Resampling.LANCZOS)
+    backdrop.paste(foreground, ((WIDTH - foreground.width) // 2, (HEIGHT - foreground.height) // 2))
+    return backdrop
 
 def render(project, folder, audios, timings, light, progress, check):
     scenes = project["scenes"]
     staging = folder / "render"
     staging.mkdir(exist_ok=True)
+    fonts = staging / "fonts"
+    fonts.mkdir(exist_ok=True)
+    shutil.copyfile(FONT, fonts / FONT.name)
+    cues = list(scene_cues(scenes, timings))
     clips = []
     for index, (scene, duration) in enumerate(zip(scenes, timings, strict=True)):
         check()
         progress(68 + round(index*26/14), f"Renderizando cena {index+1}/14")
         image = scene["image"]
         frame = staging / "frame.jpg"
-        caption = staging / "caption.png"
+        caption = staging / "cena.ass"
         clip = staging / f"clip-{index:02d}.mp4"
         with Image.open(folder / image["file"]) as original:
-            ImageOps.fit(original, (WIDTH, HEIGHT), Image.Resampling.LANCZOS).save(frame, quality=92)
-        overlay(caption, scene["text"], image)
-        direction = "0.39+on*0.0014" if index % 2 else "0.61-on*0.0014"
-        filters = (f"[0:v]scale={WIDTH*2}:{HEIGHT*2},"
-                   f"zoompan=z='1.02+on*0.00045':x='(iw-iw/zoom)*({direction})':"
-                   f"y='(ih-ih/zoom)*0.5':d=150:s={WIDTH}x{HEIGHT}:fps={FPS},"
-                   "fade=t=in:n=6,fade=t=out:s=144:n=6[base];"
-                   f"[base][1:v]overlay=enable='lt(t,{duration:.3f})'[out]")
-        run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_complex_threads", "2",
-             "-i", str(frame), "-i", str(caption), "-filter_complex", filters,
-             "-map", "[out]", "-an", "-frames:v", "150", "-pix_fmt", "yuv420p",
+            compose(original).save(frame, quality=93)
+        credit = " · ".join(filter(None, (image.get("author"), image.get("provider"))))
+        credit = textwrap.shorten(" ".join(credit.split()), width=58, placeholder="…")
+        caption.write_text(ass(scene_cues([scene], [duration]), credit), encoding="utf-8")
+        zoom = "1.015+on*0.00038" if index % 2 == 0 else "1.072-on*0.00038"
+        horizontal = "0.25+on*0.0033" if index % 4 < 2 else "0.75-on*0.0033"
+        vertical = "0.42+on*0.001" if index % 2 == 0 else "0.58-on*0.001"
+        filters = (f"scale={WIDTH*2}:{HEIGHT*2},"
+                   f"zoompan=z='{zoom}':x='(iw-iw/zoom)*({horizontal})':"
+                   f"y='(ih-ih/zoom)*({vertical})':d=150:s={WIDTH}x{HEIGHT}:fps={FPS},"
+                   "fade=t=in:n=5,fade=t=out:s=145:n=5,"
+                   "ass=filename=cena.ass:fontsdir=fonts")
+        run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_threads", "2",
+             "-i", frame.name, "-vf", filters, "-an", "-frames:v", "150", "-pix_fmt", "yuv420p",
              "-c:v", "libx264", "-threads", "2", "-preset", "ultrafast" if light else "veryfast",
-             "-crf", "23" if light else "20", str(clip)], check)
+             "-crf", "23" if light else "20", clip.name], check, cwd=staging)
         clips.append(f"file '{clip.name}'")
-    (staging / "video.txt").write_text("\n".join(clips) + "\n", encoding="ascii")
+    (staging / "video.txt").write_text("\n".join(clips) + "\n", encoding="utf-8")
     audio_path = staging / "audio.wav"
     with wave.open(str(audio_path), "wb") as combined:
         combined.setparams((1, 2, SAMPLE_RATE, 0, "NONE", "not compressed"))
         for audio_path_piece in audios:
             with wave.open(str(audio_path_piece), "rb") as audio:
                 combined.writeframesraw(audio.readframes(audio.getnframes()))
-    (staging / "legendas.srt").write_text(subtitles(scenes, timings), encoding="utf-8")
+    (staging / "legendas.srt").write_text(srt(cues), encoding="utf-8")
+    (staging / "legendas.ass").write_text(ass(cues), encoding="utf-8")
     progress(96, "Montando o MP4 e verificando a duração")
     target = staging / "video.mp4"
     run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "1",
