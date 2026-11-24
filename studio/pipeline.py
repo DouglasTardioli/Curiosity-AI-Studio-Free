@@ -40,14 +40,16 @@ def process(store, project, settings, mode, progress, check):
                     else:
                         raise ValueError("Tema já usado ou sem fonte na Wikipédia. Escolha outro tema ou categoria.")
                 check()
-                progress(12, "Escrevendo roteiro no Ollama")
-                project.update(generate(client, settings, project["topic"], project["sources"], check))
-                project["status"] = "Roteiro"
+                project.update(generate(client, settings, project["topic"], project["sources"], check, progress))
+                project["status"] = "Revisão pendente" if project.get("script_review") else "Roteiro"
                 store.save(project)
+            if project.get("script_review"):
+                progress(16, "Rascunho salvo. Revise e aprove o roteiro para continuar.")
+                return
             if mode == "Roteiro":
                 progress(100, "Roteiro salvo")
                 return
-            validate_scenes(project["scenes"])
+            validate_scenes(project["scenes"], manual=True)
             project["status"] = "Processando"
             store.save(project)
             used = {scene["image"]["url"] for scene in project["scenes"] if "image" in scene}

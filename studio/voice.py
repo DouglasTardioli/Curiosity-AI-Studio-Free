@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import json
+import logging
+import math
 import sys
 import wave
 from pathlib import Path
@@ -10,7 +12,9 @@ import edge_tts
 
 from .tools import probe, run
 
+LOGGER = logging.getLogger(__name__)
 SCENE_SECONDS = 5
+SPEECH_TARGET_SECONDS = 4.65
 SAMPLE_RATE = 48000
 SCENE_SAMPLES = SCENE_SECONDS * SAMPLE_RATE
 VOICES = {"Francisca (Edge TTS)": "pt-BR-FranciscaNeural",
@@ -26,9 +30,9 @@ def tempo_filters(speed):
 
 def fit_audio(raw, output, check):
     duration = float(probe(raw, check)["format"]["duration"])
-    if duration <= 0:
+    if not math.isfinite(duration) or duration <= 0:
         raise RuntimeError("A voz retornou áudio vazio.")
-    speed = max(1, duration / 4.65)
+    speed = max(0.85, duration / SPEECH_TARGET_SECONDS)
     fitted = output.with_suffix(".tmp.wav")
     for _ in range(3):
         run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(raw),
@@ -42,7 +46,12 @@ def fit_audio(raw, output, check):
                 audio.setparams((1, 2, SAMPLE_RATE, 0, "NONE", "not compressed"))
                 audio.writeframes(pcm + bytes((SCENE_SAMPLES - samples) * 2))
             fitted.unlink()
-            return samples / SAMPLE_RATE
+            actual = samples / SAMPLE_RATE
+            LOGGER.info("Narração %s: %.2f s medidos por FFprobe, velocidade %.2fx, %.2f s de fala ajustada.",
+                        output.name, duration, speed, actual)
+            return actual
+        LOGGER.warning("Ajuste de narração %s: %.2f s após aplicar %.2fx.",
+                       output.name, samples / SAMPLE_RATE, speed)
         speed *= 1.12
     raise RuntimeError("A fala desta cena não coube em cinco segundos. Encurte a cena.")
 

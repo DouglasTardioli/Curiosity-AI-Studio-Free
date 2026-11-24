@@ -1,4 +1,6 @@
 import copy
+import logging
+from logging.handlers import RotatingFileHandler
 import threading
 import uuid
 from pathlib import Path
@@ -15,7 +17,8 @@ from PySide6.QtWidgets import (
 from .images import normalize
 from .pipeline import Interrupted, export, process
 from .research import CATEGORIES, session
-from .script import validate_scenes
+from .script import (MAX_HOOK, SCENE_COUNT, estimated_seconds, scene_counts,
+                     validate_scenes, word_range)
 from .settings import defaults
 from .store import Store
 from .tools import binary
@@ -179,7 +182,15 @@ class Window(QMainWindow):
         self.script_text = QPlainTextEdit()
         self.script_text.setAccessibleName("Narração das cenas")
         page.addWidget(self.script_text, 2)
+        self.script_metrics = QLabel(objectName="muted")
+        self.script_metrics.setWordWrap(True)
+        page.addWidget(self.script_metrics)
+        self.script_text.textChanged.connect(self.update_script_metrics)
+        self.review_hint = QLabel(objectName="muted")
+        self.review_hint.setWordWrap(True)
+        page.addWidget(self.review_hint)
         self.save_script_button = self.button("Salvar roteiro editado", self.save_script, page)
+        self.approve_script_button = self.button("Aprovar roteiro revisado", self.approve_script, page, True)
         self.sources = QPlainTextEdit(readOnly=True)
         self.sources.setAccessibleName("Fontes e evidências")
         page.addWidget(self.sources, 1)
@@ -209,6 +220,7 @@ class Window(QMainWindow):
         fields = {
             "model": "Modelo Ollama", "ollama": "URL do Ollama",
             "light": "Modo leve · IA em CPU, sem ComfyUI",
+            "flexible_script": "Roteiro flexível · 130 a 190 palavras",
             "piper_model": "Modelo Piper pt-BR (.onnx)", "piper_bin": "Executável Piper",
             "comfy_enabled": "Usar ComfyUI", "comfy": "URL do ComfyUI",
             "workflow": "Workflow ComfyUI (JSON API)",
@@ -242,6 +254,7 @@ class Window(QMainWindow):
         for key, value in self.get_config().items():
             self.settings.setValue(key, value)
         self.settings.sync()
+        self.update_script_metrics()
         self.check_dependencies()
 
     def check_dependencies(self):
@@ -282,7 +295,7 @@ class Window(QMainWindow):
             source_names = {item["id"]: item["title"] for item in project["sources"]}
             sources = [f'{item["title"]} — {item["url"]}' for item in project["sources"]]
             for index, scene in enumerate(project["scenes"], 1):
-                citation = source_names.get(scene["source_id"], scene["source_id"])
+                citation = source_names.get(scene["source_id"], "Sem evidência validada")
                 edited = " · texto editado manualmente" if scene.get("edited") else ""
                 sources.append(f'Cena {index} · {citation}{edited}\n{scene["evidence"]}')
                 image = scene.get("image", {})
@@ -298,8 +311,29 @@ class Window(QMainWindow):
                 self.images.addItem(item)
             metadata = "\n".join(project.get(field, "") for field in ("title", "description", "hashtags"))
             self.sources.setPlainText(metadata.strip() + "\n\n" + "\n\n".join(sources))
+        review = project.get("script_review") if project else None
+        self.review_hint.setText("Revise as cenas e confira as fontes antes de aprovar." if review else "")
+        self.review_hint.setVisible(bool(review))
+        if review:
+            self.sources.appendPlainText("\nValidação automática\n" + "\n".join(review))
         self.script_text.document().setModified(False)
+        self.update_script_metrics()
         self.update_controls()
+
+    def editor_lines(self):
+        lines = [line.strip() for line in self.script_text.toPlainText().split("\n")]
+        if len(lines) == SCENE_COUNT + 1 and not lines[-1]:
+            lines.pop()
+        return lines
+
+    def update_script_metrics(self):
+        counts = scene_counts([{"text": line} for line in self.editor_lines()])
+        total = sum(counts)
+        limits = word_range(self.get_config()) if hasattr(self, "config_fields") else word_range({})
+        self.script_metrics.setText(
+            f"{total} palavras · faixa {limits[0]}–{limits[1]} · "
+            f"gancho {counts[0]}/{MAX_HOOK} · estimativa de fala {estimated_seconds(total)} s · vídeo 70 s"
+        )
 
     def update_controls(self):
         idle = self.thread is None
@@ -308,7 +342,10 @@ class Window(QMainWindow):
         for widget in (self.automatic, self.script_only, self.save_settings_button, self.category,
                        self.topic, self.voice, *self.config_fields.values()):
             widget.setEnabled(idle)
-        self.resume.setEnabled(idle and has_project)
+        review = has_project and bool(self.project.get("script_review"))
+        self.resume.setEnabled(idle and has_project and not review)
+        self.approve_script_button.setVisible(review)
+        self.approve_script_button.setEnabled(idle and review)
         self.stop.setEnabled(not idle and bool(self.work_id))
         self.export_button.setEnabled(idle and has_project and self.project["status"] == "Pronto")
         self.save_script_button.setEnabled(idle and has_scenes)
@@ -320,14 +357,18 @@ class Window(QMainWindow):
         if not self.project or not self.script_text.document().isModified():
             return True
         try:
-            lines = [line.strip() for line in self.script_text.toPlainText().splitlines() if line.strip()]
-            validate_scenes([{"text": text} for text in lines])
+            lines = self.editor_lines()
             project = copy.deepcopy(self.project)
+            if project.get("script_review"):
+                if len(lines) != SCENE_COUNT:
+                    raise ValueError("Mantenha 14 linhas, uma para cada cena.")
+            else:
+                validate_scenes([{"text": text} for text in lines], manual=True)
             for scene, text in zip(project["scenes"], lines, strict=True):
                 if scene["text"] != text:
                     scene["text"] = text
                     scene["edited"] = True
-            project["status"] = "Roteiro editado"
+            project["status"] = "Revisão pendente" if project.get("script_review") else "Roteiro editado"
             self.store.save(project)
             self.project = project
             self.refresh()
@@ -335,6 +376,21 @@ class Window(QMainWindow):
         except (ValueError, OSError) as error:
             QMessageBox.warning(self, "Roteiro", str(error))
             return False
+
+    def approve_script(self):
+        if not self.save_script():
+            return
+        try:
+            project = copy.deepcopy(self.project)
+            validate_scenes(project["scenes"], manual=True)
+            project.pop("script_review")
+            project["status"] = "Roteiro aprovado"
+            self.store.save(project)
+            self.project = project
+            self.refresh()
+            self.status.setText("Roteiro aprovado. Retome o projeto pelo Dashboard.")
+        except (ValueError, OSError) as error:
+            QMessageBox.warning(self, "Roteiro", str(error))
 
     def start_new(self, mode):
         if not self.save_script():
@@ -389,7 +445,7 @@ class Window(QMainWindow):
             normalize(filename, folder / target)
             check()
             project["scenes"][row]["image"] = credit
-            project["status"] = "Visual editado"
+            project["status"] = "Revisão pendente" if project.get("script_review") else "Visual editado"
             self.store.save(project)
             return "Imagem substituída."
         self.execute(import_image, project["id"])
@@ -437,7 +493,9 @@ class Window(QMainWindow):
         if self.work_id:
             self.project = next(item for item in self.store.history() if item["id"] == self.work_id)
             self.refresh()
-            if outcome == "ok" and self.desired_page is not None:
+            if outcome == "ok" and self.project.get("script_review"):
+                self.nav.setCurrentRow(1)
+            elif outcome == "ok" and self.desired_page is not None:
                 self.nav.setCurrentRow(self.desired_page)
         elif outcome == "ok" and not self.export_job:
             self.dependencies.setText(message)
@@ -486,5 +544,15 @@ def main():
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
     window = Window()
-    window.show()
-    return app.exec()
+    handler = RotatingFileHandler(window.store.root / "validacao.log", maxBytes=512_000,
+                                  backupCount=2, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger = logging.getLogger("studio")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        window.show()
+        return app.exec()
+    finally:
+        logger.removeHandler(handler)
+        handler.close()

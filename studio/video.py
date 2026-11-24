@@ -84,6 +84,9 @@ def render(project, folder, audios, timings, light, progress, check):
          "-disposition:s:0", "0", "-movflags", "+faststart", target.name], check, cwd=staging)
     streams = probe(target, check)["streams"]
     video = next(item for item in streams if item["codec_type"] == "video")
+    audio = next(item for item in streams if item["codec_type"] == "audio")
+    if abs(float(audio["duration"]) - 70.0) > 1 / SAMPLE_RATE:
+        raise RuntimeError("A faixa de áudio exportada precisa ter 70 segundos.")
     if ((video["width"], video["height"], video["avg_frame_rate"],
          int(video["nb_frames"]), float(video["duration"])) != (WIDTH, HEIGHT, "30/1", 2100, 70.0)):
         raise RuntimeError("O vídeo exportado não atende ao formato de 70 s a 30 FPS.")
