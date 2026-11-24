@@ -19,6 +19,9 @@ def defaults():
         "pixabay": os.getenv("PIXABAY_API_KEY", ""),
         "voice": "piper",
         "light": True,
+        "media_library": os.getenv("CURIOSITY_MEDIA_LIBRARY", ""),
+        "music": os.getenv("CURIOSITY_MUSIC", ""),
+        "online_graphics": True,
         "flexible_script": False,
         "comfy_enabled": False,
     }

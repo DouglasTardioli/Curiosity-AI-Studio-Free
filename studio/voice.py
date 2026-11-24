@@ -75,6 +75,7 @@ class SceneNarrator:
         self.settings = settings
         self.folder = folder
         self.voice = None
+        self.word_timings = []
 
     def synthesize(self, text, raw, check):
         settings = self.settings
@@ -95,9 +96,19 @@ class SceneNarrator:
             async def synthesize_edge():
                 async with asyncio.timeout(70):
                     proxy = None if proxy_bypass("speech.platform.bing.com") else getproxies().get("https")
-                    await edge_tts.Communicate(text, settings["voice"], proxy=proxy,
-                                               connect_timeout=10, receive_timeout=35).save(str(raw))
-            asyncio.run(synthesize_edge())
+                    words = []
+                    speaker = edge_tts.Communicate(text, settings["voice"], proxy=proxy,
+                                                   boundary="WordBoundary", connect_timeout=10, receive_timeout=35)
+                    with raw.open("wb") as audio:
+                        async for event in speaker.stream():
+                            check()
+                            if event["type"] == "audio":
+                                audio.write(event["data"])
+                            elif event["type"] == "WordBoundary":
+                                words.append((event["offset"] / 10_000_000, event["text"]))
+                    return words
+            return asyncio.run(synthesize_edge())
+        return []
 
     def scene(self, text, index, check):
         settings = self.settings
@@ -109,19 +120,31 @@ class SceneNarrator:
             ensure_ascii=False).encode("utf-8")).hexdigest()[:20]
         output = self.folder / f"voz-cenas-{index:02d}-{signature}.wav"
         timing = output.with_suffix(".json")
+        self.word_timings = []
         if output.is_file() and timing.is_file():
-            return output, json.loads(timing.read_text(encoding="utf-8"))
+            metadata = json.loads(timing.read_text(encoding="utf-8"))
+            if isinstance(metadata, dict):
+                self.word_timings = metadata["words"]
+                return output, metadata["cues"]
+            if settings["voice"] == "piper":
+                return output, metadata
         with tempfile.TemporaryDirectory(prefix="fala-", dir=self.folder) as temporary:
             directory = Path(temporary)
-            raw_files = []
+            raw_files, boundaries = [], []
             suffix = ".wav" if settings["voice"] == "piper" else ".mp3"
             for number, lines in enumerate(groups):
                 check()
                 raw = directory / f"raw-{number}{suffix}"
-                self.synthesize(" ".join(lines), raw, check)
+                boundaries.append(self.synthesize(" ".join(lines), raw, check))
                 raw_files.append(raw)
             cues = fit_blocks(raw_files, groups, output, directory, check)
+            for raw, words, (start, end, _) in zip(raw_files, boundaries, cues, strict=True):
+                if words:
+                    seconds = float(probe(raw, check)["format"]["duration"])
+                    self.word_timings.extend((start + offset * (end-start)/seconds, word)
+                                             for offset, word in words if offset < seconds)
             metadata = directory / "timing.json"
-            metadata.write_text(json.dumps(cues, ensure_ascii=False), encoding="utf-8")
+            metadata.write_text(json.dumps({"cues": cues, "words": self.word_timings}, ensure_ascii=False),
+                                encoding="utf-8")
             metadata.replace(timing)
             return output, cues

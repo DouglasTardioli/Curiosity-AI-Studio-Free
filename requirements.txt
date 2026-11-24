@@ -1,4 +1,4 @@
-# FFmpeg com libx264/libass e FFprobe são dependências do sistema.
+# FFmpeg com libx264, libass e filtros xfade, overlay e sidechaincompress, mais FFprobe.
 PySide6>=6.8,<7
 requests>=2.32,<3
 Pillow>=11,<13

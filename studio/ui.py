@@ -5,16 +5,17 @@ import threading
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, QSize, Qt, QStandardPaths, QThread, Signal, Slot
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtCore import QObject, QSettings, QSize, Qt, QStandardPaths, QThread, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QStackedWidget,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
     QVBoxLayout, QWidget,
 )
 
 from .captions import blocks
+from .motion import MODES
 from .images import duplicate, fingerprints, normalize
 from .pipeline import Interrupted, existing_image, export, process, retry_image
 from .research import CATEGORIES, session
@@ -161,15 +162,30 @@ class Window(QMainWindow):
         form.addRow("Categoria", self.category)
         form.addRow("Assunto personalizado", self.topic)
         form.addRow("Voz", self.voice)
+        self.edit_mode = QComboBox()
+        self.edit_mode.addItems(MODES)
+        self.edit_mode.setCurrentText(self.settings.value("edit_mode", "Leve"))
+        self.edit_mode.currentTextChanged.connect(lambda value: self.settings.setValue("edit_mode", value))
+        self.intensity = QSpinBox()
+        self.intensity.setRange(0, 100)
+        self.intensity.setSuffix("%")
+        self.intensity.setValue(self.settings.value("intensity", 60, type=int))
+        self.intensity.valueChanged.connect(lambda value: self.settings.setValue("intensity", value))
+        self.auto_approved = QCheckBox("Renderizar após aprovar o roteiro")
+        self.auto_approved.setChecked(self.settings.value("auto_approved", True, type=bool))
+        self.auto_approved.toggled.connect(lambda value: self.settings.setValue("auto_approved", value))
+        form.addRow("Modo de edição", self.edit_mode)
+        form.addRow("Intensidade", self.intensity)
+        form.addRow(self.auto_approved)
         page.addLayout(form)
-        self.automatic = self.button("Gerar roteiro e preparar imagens", lambda: self.start_new("Vídeo"), page, True)
+        self.automatic = self.button("Gerar e renderizar vídeo", lambda: self.start_new("Vídeo"), page, True)
         self.script_only = self.button("Criar roteiro para revisar", lambda: self.start_new("Roteiro"), page)
         page.addSpacing(14)
         self.current = QLabel()
         self.current.setWordWrap(True)
         self.current.setTextFormat(Qt.TextFormat.PlainText)
         page.addWidget(self.current)
-        self.resume = self.button("Preparar ou rever cenas", self.resume_project, page)
+        self.resume = self.button("Renderizar projeto atual", self.resume_project, page)
         self.stop = self.button("Interromper e salvar", self.stop_task, page)
         self.export_button = self.button("Exportar MP4, SRT, ASS e créditos", self.export_project, page)
         page.addStretch()
@@ -211,7 +227,10 @@ class Window(QMainWindow):
         self.retry = self.button("Buscar outra imagem", self.find_image, actions)
         self.replace = self.button("Selecionar imagem local", self.replace_image, actions)
         page.addLayout(actions)
-        self.render_button = self.button("Renderizar cenas revisadas",
+        self.prepare_button = self.button("Preparar cenas para revisão opcional",
+                                          lambda: self.start_project("Preparar"), page)
+        self.preview_motion = self.button("Prévia de 5 s · 540 × 960", lambda: self.start_project("Prévia"), page)
+        self.render_button = self.button("Renderizar projeto",
                                          lambda: self.start_project("Renderizar"), page, True)
 
     def show_scene(self, row):
@@ -226,7 +245,9 @@ class Window(QMainWindow):
                 f'Narração: {scene["text"]}\nConsultas: {queries}\n'
                 f'Provedor: {image.get("provider", "Pendente")}\n'
                 f'Consulta utilizada: {image.get("search_query", "—")}\n\n'
-                f"Prévia dos blocos de legenda\n{captions}"
+                f"Prévia dos blocos de legenda\n{captions}\n\n"
+                + ("Destaques: tempos de palavras do sintetizador." if scene.get("word_timings")
+                   else "Destaques: posições estimadas dentro dos blocos de fala.")
             )
         self.update_controls()
 
@@ -262,7 +283,12 @@ class Window(QMainWindow):
         page = self.page("Configurações")
         self.config_fields = {}
         self.initial = defaults()
-        form = QFormLayout()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        fields_widget = QWidget()
+        form = QFormLayout(fields_widget)
+        scroll.setWidget(fields_widget)
         fields = {
             "model": "Modelo Ollama", "ollama": "URL do Ollama",
             "light": "Modo leve · IA em CPU, sem ComfyUI",
@@ -271,6 +297,8 @@ class Window(QMainWindow):
             "comfy_enabled": "Usar ComfyUI", "comfy": "URL do ComfyUI",
             "workflow": "Workflow ComfyUI (JSON API)",
             "pexels": "Chave gratuita Pexels", "pixabay": "Chave gratuita Pixabay",
+            "media_library": "Pasta de PNGs e vídeos locais", "music": "Arquivo opcional de música",
+            "online_graphics": "Buscar PNGs em serviços gratuitos",
         }
         for key, label in fields.items():
             value = self.initial[key]
@@ -287,14 +315,15 @@ class Window(QMainWindow):
         index = self.voice.findData(self.settings.value("voice", self.initial["voice"]))
         self.voice.setCurrentIndex(max(0, index))
         self.voice.blockSignals(False)
-        page.addLayout(form)
+        page.addWidget(scroll, 1)
         self.save_settings_button = self.button("Salvar configurações e verificar dependências",
                                                 self.save_settings, page)
         page.addStretch()
 
     def get_config(self):
         return {**{key: field.isChecked() if isinstance(field, QCheckBox) else field.text().strip()
-                   for key, field in self.config_fields.items()}, "voice": self.voice.currentData()}
+                   for key, field in self.config_fields.items()}, "voice": self.voice.currentData(),
+                "edit_mode": self.edit_mode.currentText(), "intensity": self.intensity.value()}
 
     def save_settings(self):
         for key, value in self.get_config().items():
@@ -390,7 +419,7 @@ class Window(QMainWindow):
         has_project = bool(self.project)
         has_scenes = has_project and bool(self.project["scenes"])
         for widget in (self.automatic, self.script_only, self.save_settings_button, self.category,
-                       self.topic, self.voice, *self.config_fields.values()):
+                       self.topic, self.voice, self.edit_mode, self.intensity, self.auto_approved, *self.config_fields.values()):
             widget.setEnabled(idle)
         review = has_project and bool(self.project.get("script_review"))
         self.resume.setEnabled(idle and has_project and not review)
@@ -403,10 +432,9 @@ class Window(QMainWindow):
         selected = idle and has_scenes and self.images.currentRow() >= 0
         self.replace.setEnabled(selected)
         self.retry.setEnabled(selected and not review)
-        self.render_button.setEnabled(idle and has_scenes and not review
-                                      and all(scene.get("image") and not scene["image"].get("placeholder")
-                                              and scene["image"].get("provider") != "Cartão gráfico"
-                                              for scene in self.project["scenes"]))
+        self.render_button.setEnabled(idle and has_scenes and not review)
+        self.prepare_button.setEnabled(idle and has_scenes and not review)
+        self.preview_motion.setEnabled(idle and has_scenes and not review)
         self.open_button.setEnabled(idle and self.history.currentRow() >= 0)
 
     def save_script(self):
@@ -425,6 +453,8 @@ class Window(QMainWindow):
                     scene["text"] = text
                     scene["edited"] = True
                     scene.pop("keywords", None)
+                    if scene.get("image", {}).get("generated"):
+                        scene.pop("image")
             project["status"] = "Revisão pendente" if project.get("script_review") else "Roteiro editado"
             self.store.save(project)
             self.project = project
@@ -445,7 +475,10 @@ class Window(QMainWindow):
             self.store.save(project)
             self.project = project
             self.refresh()
-            self.status.setText("Roteiro aprovado. Retome o projeto pelo Dashboard.")
+            if self.auto_approved.isChecked():
+                self.start_project("Vídeo")
+            else:
+                self.status.setText("Roteiro aprovado. Retome o projeto pelo Dashboard.")
         except (ValueError, OSError) as error:
             QMessageBox.warning(self, "Roteiro", str(error))
 
@@ -487,30 +520,10 @@ class Window(QMainWindow):
         filename, _ = QFileDialog.getOpenFileName(self, "Selecionar imagem", filter="Imagens (*.jpg *.jpeg *.png *.webp)")
         if not filename:
             return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Créditos da imagem")
-        layout = QFormLayout(dialog)
-        author, license_name, source = QLineEdit(), QLineEdit(), QLineEdit()
-        layout.addRow("Autor", author)
-        layout.addRow("Licença ou permissão", license_name)
-        layout.addRow("URL da fonte, se houver", source)
-        controls = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        controls.button(QDialogButtonBox.StandardButton.Ok).setText("Confirmar")
-        controls.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancelar")
-        controls.accepted.connect(dialog.accept)
-        controls.rejected.connect(dialog.reject)
-        layout.addRow(controls)
-        if not dialog.exec():
-            return
-        if not author.text().strip() or not license_name.text().strip():
-            QMessageBox.warning(self, "Créditos", "Preencha a autoria e a licença ou permissão de uso.")
-            return
         project = copy.deepcopy(self.project)
         folder = self.store.folder(project)
         target = f"manual-{uuid.uuid4().hex}.jpg"
-        credit = {"provider": "Imagem manual", "file": target, "title": Path(filename).name,
-                  "author": author.text().strip(), "license": license_name.text().strip(),
-                  "url": source.text().strip()}
+        credit = {"provider": "Imagem manual", "file": target, "title": Path(filename).name}
         def import_image(progress, check):
             normalize(filename, folder / target)
             check()
@@ -527,18 +540,20 @@ class Window(QMainWindow):
         self.execute(import_image, project["id"])
 
     def start_project(self, mode):
-        if mode == "Renderizar" and not self.save_script():
+        if mode in ("Renderizar", "Preparar", "Prévia") and not self.save_script():
             return
         project = copy.deepcopy(self.project)
         config = self.get_config()
         def operation(progress, check):
             process(self.store, project, config, mode, progress, check)
-        self.execute(operation, project["id"], {"Roteiro": 1, "Vídeo": 2}.get(mode))
+        self.execute(operation, project["id"], {"Roteiro": 1, "Preparar": 2, "Prévia": 2}.get(mode),
+                     preview_job=mode == "Prévia")
 
-    def execute(self, operation, work_id=None, desired_page=None, export_job=False):
+    def execute(self, operation, work_id=None, desired_page=None, export_job=False, preview_job=False):
         self.work_id = work_id
         self.desired_page = desired_page
         self.export_job = export_job
+        self.preview_job = preview_job
         self.result = None
         self.progress.setValue(0)
         self.thread = QThread(self)
@@ -575,6 +590,10 @@ class Window(QMainWindow):
                 self.nav.setCurrentRow(1)
             elif outcome == "ok" and self.desired_page is not None:
                 self.nav.setCurrentRow(self.desired_page)
+                if self.preview_job:
+                    path = self.store.folder(self.project) / "previa" / "video.mp4"
+                    if path.is_file():
+                        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
         elif outcome == "ok" and not self.export_job:
             self.dependencies.setText(message)
             self.status.setText("Pronto")

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import random
 import shutil
@@ -6,6 +8,8 @@ from pathlib import Path
 
 import requests
 
+from .decoration import artwork, fallback_plate, video_asset
+from .motion import MODES, plans_for, predict
 from .images import acquire, duplicate, fingerprints, generate_keywords
 from .research import CATEGORIES, key, research, session
 from .script import generate, validate_scenes
@@ -20,13 +24,8 @@ class Interrupted(Exception):
 
 def process(store, project, settings, mode, progress, check):
     folder = store.folder(project)
+    previous_status = project["status"]
     try:
-        if mode == "Renderizar":
-            if not (binary("ffmpeg") and binary("ffprobe")):
-                raise RuntimeError("Instale FFmpeg e FFprobe e adicione ambos ao PATH.")
-            filters = run(["ffmpeg", "-hide_banner", "-filters"], check)
-            if not any(line.split()[1:3] == ["ass", "V->V"] for line in filters.splitlines()):
-                raise RuntimeError("A renderização de legendas exige FFmpeg com libass (filtro ass).")
         with session() as client:
             if not project["scenes"]:
                 progress(4, "Pesquisando na Wikipédia")
@@ -59,32 +58,54 @@ def process(store, project, settings, mode, progress, check):
                 progress(100, "Roteiro salvo")
                 return
             validate_scenes(project["scenes"], manual=True)
-            if mode != "Renderizar":
+            if mode in ("Vídeo", "Renderizar", "Prévia"):
+                if not (binary("ffmpeg") and binary("ffprobe")):
+                    raise RuntimeError("Instale FFmpeg e FFprobe e adicione ambos ao PATH.")
+                filters = run(["ffmpeg", "-hide_banner", "-filters"], check)
+                available = {parts[1] for line in filters.splitlines()
+                             if len(parts := line.split()) >= 3}
+                missing = {"ass", "xfade", "overlay", "avgblur", "rgbashift", "sidechaincompress"} - available
+                if missing:
+                    raise RuntimeError(f"Use uma compilação completa do FFmpeg com libass. "
+                                       f"Filtros ausentes: {', '.join(sorted(missing))}.")
+            preview = mode == "Prévia"
+            if preview:
+                if not existing_image(project["scenes"][0], folder):
+                    prepare_images(client, store, project, settings, folder, progress, check, count=1)
+            elif not images_ready(project, folder):
                 prepare_images(client, store, project, settings, folder, progress, check)
+            if mode == "Preparar":
+                progress(46, "Cenas disponíveis para revisão opcional.")
                 return
-            if not images_ready(project, folder):
-                raise ValueError("Revise as 14 cenas e substitua imagens pendentes ou duplicadas.")
-            project["status"] = "Processando"
-            store.save(project)
+            prepare_edit(client, store, project, settings, folder, progress, check, preview)
+            if not preview:
+                project["status"] = "Processando"
+                store.save(project)
         audios, timings = [], []
         narrator = SceneNarrator(settings, folder)
-        for index, scene in enumerate(project["scenes"], 1):
+        selected = project["scenes"][:1] if preview else project["scenes"]
+        for index, scene in enumerate(selected, 1):
             check()
             progress(46 + round(index*20/14), f"Narrando cena {index}/14")
             audio, cues = narrator.scene(scene["text"], index, check)
             audios.append(audio)
             timings.append(cues)
-        out = render(project, folder, audios, timings, settings["light"], progress, check)
-        (out / "creditos-e-publicacao.txt").write_text(credits(project), encoding="utf-8")
+            scene["word_timings"] = narrator.word_timings
+        out = render({**project, "scenes": selected}, folder, audios, timings, settings["light"],
+                     progress, check, settings={**settings, "draft": preview})
+        if preview:
+            progress(100, "Prévia de cinco segundos pronta.")
+            return
+        (out / "creditos-e-publicacao.txt").write_text(credits(project, settings.get("music")), encoding="utf-8")
         project["status"] = "Pronto"
         store.save(project)
         progress(100, "Vídeo pronto para exportar")
     except Interrupted:
-        project["status"] = "Interrompido"
+        project["status"] = previous_status if mode == "Prévia" else "Interrompido"
         store.save(project)
         raise
     except Exception:
-        project["status"] = "Erro recuperável"
+        project["status"] = previous_status if mode == "Prévia" else "Erro recuperável"
         store.save(project)
         raise
 
@@ -106,9 +127,10 @@ def images_ready(project, folder):
     used = []
     for scene in project["scenes"]:
         image = existing_image(scene, folder)
-        if not image or duplicate(image, used):
+        if not image or (not image.get("generated") and duplicate(image, used)):
             return False
-        used.append(image)
+        if not image.get("generated"):
+            used.append(image)
     return True
 
 def ensure_keywords(client, store, project, settings, progress, check):
@@ -125,15 +147,16 @@ def ensure_keywords(client, store, project, settings, progress, check):
                 scene["keywords"] = keywords
             store.save(project)
 
-def prepare_images(client, store, project, settings, folder, progress, check):
+def prepare_images(client, store, project, settings, folder, progress, check, count=14):
     ensure_keywords(client, store, project, settings, progress, check)
-    scenes = project["scenes"]
+    scenes = project["scenes"][:count]
     used, pending = [], []
     for index, scene in enumerate(scenes, 1):
         image = existing_image(scene, folder)
-        if image and not duplicate(image, used):
+        if image and (image.get("generated") or not duplicate(image, used)):
             scene["image"] = image
-            used.append(image)
+            if not image.get("generated"):
+                used.append(image)
         else:
             pending.append((index, scene))
     for index, scene in pending:
@@ -141,15 +164,72 @@ def prepare_images(client, store, project, settings, folder, progress, check):
         progress(18 + index * 2, f"Buscando imagem {index}/14")
         image = acquire(client, settings, folder, scene, index, used, check,
                         cache=store.root / "cache-imagens")
-        scene["image"] = image
-        if not image.get("placeholder"):
+        if image.get("placeholder"):
+            (folder / image["file"]).unlink(missing_ok=True)
+            image = fallback_plate(folder, scene, project["topic"], index)
+        else:
             used.append(image)
+        scene["image"] = image
         store.save(project)
     project["status"] = "Revisar cenas"
     store.save(project)
-    missing = sum(bool(scene["image"].get("placeholder")) for scene in scenes)
-    label = f" · {missing} imagens pendentes" if missing else ""
-    progress(46, f"Revise as cenas antes de renderizar{label}.")
+    progress(46, "Imagens e ilustrações prontas.")
+
+def prepare_edit(client, store, project, settings, folder, progress, check, preview=False):
+    mode = settings.get("edit_mode", "Leve")
+    if mode not in MODES:
+        mode = "Leve"
+    library = settings.get("media_library", "")
+    config = [mode, settings.get("model"), library, settings.get("online_graphics", True), bool(settings.get("intensity", 60)),
+              bool(settings.get("pixabay")), settings.get("ollama")]
+    signature = hashlib.sha256(json.dumps(
+        [config, [scene["text"] for scene in project["scenes"]]], ensure_ascii=False
+    ).encode("utf-8")).hexdigest()
+    if project.get("edit_signature") != signature:
+        progress(47, "Planejando movimentos, elementos e transições")
+        try:
+            predicted = predict(client, project, settings, mode, check) if settings.get("intensity", 60) else []
+        except (requests.RequestException, ValueError, KeyError, RuntimeError, AttributeError, TypeError) as error:
+            check()
+            LOGGER.info("Plano determinístico aplicado: %s", type(error).__name__)
+            predicted = []
+        for scene, plan in zip(project["scenes"], plans_for(project, mode, predicted), strict=True):
+            scene["edit"] = plan
+            scene.pop("graphic", None)
+            scene.pop("video", None)
+        project["edit_signature"] = signature
+        store.save(project)
+    used_graphics, used_videos = set(), set()
+    scenes = project["scenes"]
+    for scene in scenes:
+        if scene.get("graphic"):
+            for field in ("sha256", "asset"):
+                if scene["graphic"].get(field):
+                    used_graphics.add(scene["graphic"][field])
+        for field in ("url", "cache_key"):
+            if scene.get("video", {}).get(field):
+                used_videos.add(scene["video"][field])
+    for index, scene in enumerate(scenes[:1] if preview else scenes):
+        check()
+        plan = scene["edit"]
+        strength = settings.get("intensity", 60)
+        if strength and (mode != "Leve" or index % 4 == 0):
+            if not scene.get("graphic") or not (folder / scene["graphic"]["file"]).is_file():
+                scene["graphic"] = artwork(client, settings, plan["graphic"], folder,
+                                           store.root / "cache-png", used_graphics, index,
+                                           plan["highlight"], mode, check)
+        if strength and plan["media"] == "video" and "video" not in scene:
+            candidate = video_asset(client, settings, plan["graphic"], folder, index, used_videos, check)
+            if candidate:
+                from .tools import probe
+                try:
+                    valid = any(stream.get("codec_type") == "video" and stream.get("width", 0) >= 240
+                                for stream in probe(folder / candidate["file"], check)["streams"])
+                except (RuntimeError, ValueError, KeyError):
+                    valid = False
+                if valid:
+                    scene["video"] = candidate
+        store.save(project)
 
 def retry_image(store, project, settings, row, progress, check):
     folder = store.folder(project)

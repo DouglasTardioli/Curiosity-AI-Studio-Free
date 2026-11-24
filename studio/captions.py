@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from PIL import ImageFont
@@ -52,7 +53,7 @@ def ass_text(text):
     # ASS uses braces for overrides and backslash sequences for layout.
     return text.replace("\\", "／").replace("{", "｛").replace("}", "｝")
 
-def ass(cues, credit=""):
+def ass(cues, highlight="", intensity=0, words=()):
     header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -63,15 +64,35 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Caption,DejaVu Sans,55,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,5,0,2,110,110,500,1
-Style: Credit,DejaVu Sans,24,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,2,110,110,420,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     rows = []
+    highlight = highlight.strip(".,!?;:")
     for start, end, lines in cues:
-        text = r"\N".join(ass_text(line) for line in lines)
+        tokens = " ".join(lines).split()
+        matching = next((index for index, word in enumerate(tokens)
+                         if word.strip(".,!?;:").casefold() == highlight.casefold()), None)
+        aligned = next((at for at, word in words if start <= at < end
+                        and word.strip(".,!?;:").casefold() == highlight.casefold()), None)
+        delay = 0
+        if matching is not None:
+            selected = aligned if aligned is not None else start + matching * (end-start) / len(tokens)
+            delay = max(0, round((selected - start)*1000))
+        encoded = []
+        for line in lines:
+            line = ass_text(line)
+            if highlight:
+                pattern = r"(?<!\w)" + re.escape(ass_text(highlight)) + r"(?!\w)"
+                line = re.sub(pattern, lambda match: (rf"{{\t({delay},{delay+70},\c&H0054E4FF&)}}"
+                                                      + match[0] + r"{\c&H00FFFFFF&}"),
+                              line, flags=re.IGNORECASE)
+            encoded.append(line)
+        text = r"\N".join(encoded)
+        if intensity:
+            pop = 100 + round(7 * intensity)
+            text = (rf"{{\fad(85,65)\fscx97\fscy97\t(0,130,\fscx{pop}\fscy{pop})"
+                    rf"\t(130,250,\fscx100\fscy100)}}" + text)
         rows.append(f"Dialogue: 0,{timestamp(start, True)},{timestamp(end, True)},Caption,,0,0,0,,{text}")
-    if credit:
-        rows.append(f"Dialogue: 0,0:00:00.00,0:00:05.00,Credit,,0,0,0,,{ass_text(credit)}")
     return header + "\n".join(rows) + "\n"

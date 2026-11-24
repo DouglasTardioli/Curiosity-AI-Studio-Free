@@ -27,14 +27,16 @@ def get(client, url, **kwargs):
     response.raise_for_status()
     return response.json()
 
-def commons(client, query):
+def commons(client, query, *, graphics=False):
+    suffix = " filetype:drawing" if graphics else " filetype:bitmap"
+    extensions = r"\.(?:svg|png)$" if graphics else r"\.(?:jpe?g|png|webp|tiff?)$"
     data = get(client, COMMONS, params={
-        "action": "query", "generator": "search", "gsrsearch": query + " filetype:bitmap",
+        "action": "query", "generator": "search", "gsrsearch": query + suffix,
         "gsrnamespace": 6, "gsrlimit": 20, "prop": "imageinfo",
-        "iiprop": "url|size|extmetadata", "iiurlwidth": 1600, "format": "json", "formatversion": 2,
+        "iiprop": "url|size|extmetadata", "iiurlwidth": 640 if graphics else 1600, "format": "json", "formatversion": 2,
     })
     for page in sorted(data.get("query", {}).get("pages", []), key=lambda item: item.get("index", 0)):
-        if not re.search(r"\.(?:jpe?g|png|webp|tiff?)$", page["title"], re.IGNORECASE):
+        if not re.search(extensions, page["title"], re.IGNORECASE):
             continue
         for info in page.get("imageinfo", []):
             meta = {k: v["value"] for k, v in info.get("extmetadata", {}).items()}
@@ -264,7 +266,10 @@ def acquire(client, settings, folder, scene, index, used, check, *, cache=None, 
                 except (requests.RequestException, ValueError, KeyError):
                     if provider.__name__ not in notes:
                         notes.append(provider.__name__)
-            candidates.sort(key=lambda item: (relevance(item, query), quality(item)), reverse=True)
+            candidates.sort(key=lambda item: (
+                relevance(item, query)[0],
+                item.get("license") in {"Public domain", "CC0", "Pexels License", "Pixabay Content License"},
+                relevance(item, query)[1:], quality(item)), reverse=True)
             for offset in range(0, min(9, len(candidates)), 3):
                 batch = candidates[offset:offset + 3]
                 futures = [pool.submit(cached_download, item, cache, check) for item in batch]
