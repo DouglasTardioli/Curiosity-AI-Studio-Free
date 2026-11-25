@@ -31,6 +31,12 @@ ollama pull qwen2.5:3b
 3. A galeria é opcional. Use **Preparar cenas para revisão opcional**, **Buscar outra imagem** ou **Selecionar imagem local**. O seletor local importa o arquivo sem pedir autoria ou licença. Use arquivos locais que você tenha autorização para reutilizar. A prévia da primeira cena abre no player padrão em 540 × 960 a 30 FPS.
 4. Exporte o MP4 vertical com 70 s, 1080 × 1920, 30 FPS, H.264 e AAC. A exportação também inclui legendas SRT e ASS, fontes e créditos de mídia. As informações de autoria e licença ficam nos créditos exportados.
 
+### Roteiro manual
+
+No Dashboard, selecione **Inserir roteiro manualmente**. Digite, cole ou importe um TXT em UTF-8. Use 14 linhas, uma por cena, com 145 a 175 palavras no total. O gancho aceita até 12 palavras, e cada cena seguinte aceita até 18. O editor atualiza os contadores e realça as linhas inválidas.
+
+**Salvar roteiro** guarda o rascunho no Histórico, inclusive antes de atender aos limites. **Aprovar e gerar vídeo** valida o texto e inicia a produção das 14 cenas de 5 segundos. O Ollama é usado apenas para consultas e planejamento visual. A narração e as legendas usam o texto aprovado, e o aplicativo registra os créditos disponíveis automaticamente.
+
 ## Edição e mídia
 
 - **Leve** aplica movimentos de câmera suaves, crossfade e poucos elementos. **Dinâmico** acrescenta gráficos animados, impactos, transições e som. **Cinematográfico** usa movimentos em camadas, partículas geradas e desfoque. **Viral** alterna zoom de impacto, tremilique, salto e pop-up. Ajuste a intensidade de 0% a 100%. Em 0%, os efeitos opcionais ficam desativados.

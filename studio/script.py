@@ -47,6 +47,35 @@ def validate_scenes(scenes, limits=STRICT_RANGE, manual=False):
     if issues:
         raise ValueError(" ".join(issues))
 
+def manual_lines(text):
+    # TXT files commonly end with a line terminator.
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").removesuffix("\n")
+    return lines.split("\n") if lines else []
+
+
+def invalid_manual_lines(counts):
+    return [index for index, count in enumerate(counts)
+            if index >= SCENE_COUNT or not 1 <= count <= (MAX_HOOK if index == 0 else MAX_SCENE)]
+
+
+def approve_manual(project, text):
+    lines = manual_lines(text)
+    counts = [len(words(line)) for line in lines]
+    issues = scene_issues(counts)
+    if issues:
+        raise ValueError(" ".join(issues))
+    previous = dict(enumerate(project["scenes"]))
+    scenes = []
+    for index, line in enumerate(lines):
+        scene = previous.get(index, {})
+        if scene.get("text") != line:
+            scene = {"text": line, "query": string(line),
+                     "prompt": f"Imagem vertical sem texto: {line}", "evidence": "", "source_id": ""}
+        scenes.append(scene)
+    project.update(manual_script=text, manual_approved=True, scenes=scenes,
+                   status="Roteiro aprovado")
+
+
 def object_schema(fields):
     return {"type": "object", "properties": fields, "required": list(fields)}
 
