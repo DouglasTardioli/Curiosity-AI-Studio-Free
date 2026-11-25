@@ -4,6 +4,12 @@ import shutil
 import subprocess
 import tempfile
 
+class CommandError(RuntimeError):
+    def __init__(self, stderr):
+        self.stderr = stderr
+        super().__init__(stderr[-1800:])
+
+
 def binary(name):
     return shutil.which(name)
 
@@ -31,7 +37,7 @@ def run(args, check, cwd=None, text_input=None):
             stdout.seek(0)
             stderr.seek(0)
             if process.returncode:
-                raise RuntimeError(stderr.read().decode("utf-8", "replace")[-1800:])
+                raise CommandError(stderr.read().decode("utf-8", "replace"))
             return stdout.read().decode("utf-8", "replace")
 
 def probe(path, check):

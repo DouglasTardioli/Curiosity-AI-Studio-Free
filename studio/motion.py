@@ -4,6 +4,10 @@ import math
 
 from .script import STRING, object_schema, request_json, scene_array
 
+FPS = 30
+SCENE_FRAMES = 5 * FPS
+GRAPHIC_MIN_SCALE = .25
+
 MODES = ("Leve", "Dinâmico", "Cinematográfico", "Viral")
 CAMERAS = ("ken-burns", "parallax", "shake", "impact", "glitch")
 ENTRANCES = ("fade", "triumph", "bounce", "pop", "slide-left", "slide-right", "slide-up",
@@ -124,12 +128,12 @@ def ease(variable, kind):
 
 def camera_filter(width, height, index, plan, moment, strength, video=False):
     amount = strength
-    p = ease("on/149", "in-out")
-    event = f"max(0,1-abs(on/30-{moment:.4f})/0.19)"
+    p = ease(f"on/{SCENE_FRAMES - 1}", "in-out")
+    event = f"max(0,1-abs(on/{FPS}-{moment:.4f})/0.19)"
     zoom = f"1.012+{.072 * amount:.5f}*{p if index % 2 == 0 else f'(1-{p})'}"
     name = plan["camera"]
     if name == "impact":
-        zoom += f"+{.115 * amount:.5f}*pow(max(0,1-(on/30-{moment:.4f})/0.34),3)*gte(on/30,{moment:.4f})"
+        zoom += f"+{.115 * amount:.5f}*pow(max(0,1-(on/{FPS}-{moment:.4f})/0.34),3)*gte(on/{FPS},{moment:.4f})"
     elif name == "shake":
         zoom += f"+{.024 * amount:.5f}*{event}"
     x = f"0.50+{.26 * amount * (-1 if index % 2 else 1):.5f}*({p}-0.5)"
@@ -138,7 +142,7 @@ def camera_filter(width, height, index, plan, moment, strength, video=False):
         x += f"+{.32 * amount:.5f}*{event}*sin(on*2.8)"
         y += f"+{.32 * amount:.5f}*{event}*cos(on*3.2)"
     graph = (f"zoompan=z='{zoom}':x='(iw-iw/zoom)*({x})':y='(ih-ih/zoom)*({y})'"
-             f":d={1 if video else 150}:s={width}x{height}:fps=30")
+             f":d={1 if video else SCENE_FRAMES}:s={width}x{height}:fps={FPS}")
     if name == "glitch" and amount:
         graph += f",rgbashift=rh={max(1, round(5*amount))}:bh=-3:enable='between(t,{moment:.4f},{moment+.10:.4f})'"
     if name == "impact" and amount >= .5:
@@ -148,19 +152,30 @@ def camera_filter(width, height, index, plan, moment, strength, video=False):
         graph += f",avgblur=sizeX=3:sizeY=1:enable='between(t,{start:.4f},{end:.4f})'"
     return graph
 
+def graphic_canvas_size(width):
+    return 2 * round(width * .72 / 2)
+
+
 def overlay_filters(width, plan, moment, strength):
     duration = plan["duration"]
-    p = f"min(1,max(0,(t-{moment:.4f})/{duration:.4f}))"
+    progress = f"min(1,max(0,({{clock}}-{moment:.4f})/{duration:.4f}))"
     entrance = plan["entrance"]
-    eased = ease(p, "back" if entrance in {"triumph", "bounce", "pop"} else "out")
-    size = width * .31
-    scale = f"{size:.3f}*({plan['scale_to']:.4f}+{strength*(plan['scale_from']-plan['scale_to']):.4f}*(1-{eased}))"
+    curve = "back" if entrance in {"triumph", "bounce", "pop"} else "out"
+    eased = ease(progress.format(clock="t"), curve)
+    canvas = graphic_canvas_size(width)
+    # zoompan sees one still image and produces a fixed-size alpha stream.
+    zoom_eased = ease(progress.format(clock=f"on/{FPS}"), curve)
+    scale = f"{plan['scale_to']:.4f}+{strength*(plan['scale_from']-plan['scale_to']):.4f}*(1-{zoom_eased})"
     if entrance == "pulse":
-        scale += f"+{size * .047 * strength:.3f}*sin(6*t)"
+        scale += f"+{.047 * strength:.4f}*sin(6*on/{FPS})"
     rotation = strength * (plan["rotation"] or (16 if entrance == "spin" else 0))
-    alpha = f"format=rgba,scale=w='max(16,2*trunc(({scale})/2))':h=-2:eval=frame"
+    alpha = (
+        f"format=yuva444p,zoompan=z='({scale})/{GRAPHIC_MIN_SCALE}':"
+        f"x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':d={SCENE_FRAMES}:s={canvas}x{canvas}:fps={FPS},"
+        "setsar=1,format=rgba"
+    )
     if rotation:
-        alpha += f",rotate='{rotation*math.pi/180:.5f}*(1-{eased})':ow=iw:oh=ih:c=none"
+        alpha += f",rotate='{rotation*math.pi/180:.5f}*(1-{eased})':ow={canvas}:oh={canvas}:c=none"
     alpha += f",fade=t=in:st={moment:.4f}:d=0.14:alpha=1,fade=t=out:st=4.58:d=0.22:alpha=1"
     pos = {"top-left": .28, "top-right": .72, "center": .5}[plan["position"]]
     x = f"W*{pos}-w/2"
@@ -180,7 +195,7 @@ def overlay_filters(width, plan, moment, strength):
     if plan["exit"] != "fade":
         sign = -1 if plan["exit"] == "slide-up" else 1
         y += f"+({sign*.19*strength:.5f})*H*pow(max(0,(t-4.58)/0.42),3)"
-    position = f"overlay=x='{x}':y='{y}':enable='between(t,{moment:.4f},4.84)':format=auto"
+    position = f"overlay=x='{x}':y='{y}':enable='between(t,{moment:.4f},4.84)':format=rgb:alpha=straight"
     return alpha, position
 
 def align_plan(plan, cues, measured):
