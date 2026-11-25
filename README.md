@@ -44,6 +44,7 @@ No Dashboard, selecione **Inserir roteiro manualmente**. Digite, cole ou importe
 - O aplicativo pesquisa imagens conforme as fontes disponíveis e prioriza mídias de domínio público, CC0 ou com licença comercial compatível entre os resultados relevantes. Os provedores de PNG incluem Commons, Openverse, Pixabay e Openclipart quando disponíveis. A busca valida metadados, formato e transparência real. Se faltar uma mídia adequada, o aplicativo gera uma peça em Pillow para continuar automaticamente.
 - Uma pasta de mídia local pode conter PNGs e clipes `.mp4`, `.mov` ou `.webm`. Use nomes descritivos em inglês para combinar com as palavras-chave. Vídeos licenciados também podem ser obtidos no Pixabay quando a chave gratuita está configurada. PNGs, imagens, narrações, efeitos sonoros e cenas renderizadas são reaproveitados localmente.
 - O aplicativo sintetiza efeitos CC0, como whoosh, impacto, pop e suspense. Você pode indicar uma faixa musical local. O FFmpeg faz ducking de música e efeitos conforme a narração. Arquivos de música importados ficam identificados nos créditos.
+- O FFprobe verifica as mídias de entrada, as cenas renderizadas e o MP4 final. O vídeo final usa 1080 × 1920, 30 FPS constantes, pixels quadrados e yuv420p. Se um efeito falhar, o aplicativo tenta uma versão simplificada e, se necessário, renderiza a cena com zoom suave. O arquivo `validacao.log` registra a cena, o efeito, os formatos de entrada, o comando e os erros do FFmpeg.
 - As legendas usam DejaVu Sans Bold, contorno preto e até duas linhas na área segura. Nos modos animados, a palavra importante ganha destaque amarelo. O Edge TTS pode fornecer tempos por palavra. Com Piper ou quando esses tempos estiverem indisponíveis, a duração de cada bloco vem do áudio e a posição da palavra dentro do bloco é estimada. SRT e ASS são UTF-8.
 
 ## Configurações
@@ -63,6 +64,6 @@ python -m unittest discover -s tests -v
 CURIOSITY_TEST_RENDER=1 python -m unittest discover -s tests -v
 ```
 
-No Prompt de Comando do Windows, use `set CURIOSITY_TEST_RENDER=1` antes do segundo comando. O teste completo usa o FFmpeg real e confirma os fluxos de vídeo, áudio e legenda.
+No Prompt de Comando do Windows, use `set CURIOSITY_TEST_RENDER=1` antes do segundo comando. A suíte de renderização usa o FFmpeg real para testar os efeitos, as transições e os fluxos de vídeo, áudio e legenda. Também valida um MP4 de 70 segundos com 14 cenas.
 
 Para reproduzir a prévia animada no modo Viral, escolha um roteiro com Piper, selecione intensidade de 80% e clique em **Prévia de 5 s** na galeria.

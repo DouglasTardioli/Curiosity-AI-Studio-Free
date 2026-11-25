@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import shutil
 import tempfile
 import wave
@@ -8,12 +9,15 @@ from pathlib import Path
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from .captions import FONT, ass, scene_cues, srt
-from .motion import MODES, TRANSITIONS, align_plan, camera_filter, event_moment, overlay_filters, plans_for
+from .motion import (FPS, GRAPHIC_MIN_SCALE, MODES, SCENE_FRAMES, TRANSITIONS, align_plan,
+                     camera_filter, event_moment, graphic_canvas_size, overlay_filters, plans_for)
 from .sound import track
-from .tools import probe, run
-from .voice import SAMPLE_RATE
+from .tools import CommandError, probe, run
+from .voice import SAMPLE_RATE, SCENE_SECONDS
 
-WIDTH, HEIGHT, FPS = 1080, 1920, 30
+WIDTH, HEIGHT = 1080, 1920
+VIDEO_TIMESCALE = FPS * 1000
+LOGGER = logging.getLogger(__name__)
 
 def compose(original, width=WIDTH, height=HEIGHT):
     source = ImageOps.exif_transpose(original).convert("RGB")
@@ -31,91 +35,199 @@ def compose_file(source, output, width, height):
         compose(original, width, height).save(output, quality=94)
 
 def file_digest(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    try:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError:
+        # FFprobe reports unreadable media with the scene and effect context.
+        return None
+
+def graphic_file(source, output, width):
+    canvas = graphic_canvas_size(width) * 4
+    size = round(width * .31 * GRAPHIC_MIN_SCALE * 4)
+    with Image.open(source) as original:
+        sprite = ImageOps.contain(original.convert("RGBA"), (size, size), Image.Resampling.LANCZOS)
+    image = Image.new("RGBA", (canvas, canvas))
+    image.paste(sprite, ((canvas - sprite.width) // 2, (canvas - sprite.height) // 2))
+    image.save(output)
+
+
+def video_stream(path, check):
+    stream = next((item for item in probe(path, check)["streams"]
+                   if item["codec_type"] == "video"), None)
+    if not stream or not stream.get("width") or not stream.get("height") or not stream.get("pix_fmt"):
+        raise ValueError(f"Arquivo sem fluxo de vídeo válido: {path}")
+    return stream
+
+
+def validate_video(stream, width, height, frames):
+    expected = {
+        "width": width, "height": height, "pix_fmt": "yuv420p", "sample_aspect_ratio": "1:1",
+        "r_frame_rate": f"{FPS}/1", "avg_frame_rate": f"{FPS}/1",
+        "time_base": f"1/{VIDEO_TIMESCALE}", "nb_frames": str(frames),
+        "duration_ts": frames * (VIDEO_TIMESCALE // FPS),
+    }
+    errors = {key: (expected_value, stream.get(key)) for key, expected_value in expected.items()
+              if stream.get(key) != expected_value}
+    if errors:
+        raise RuntimeError(f"Formato de vídeo inválido (esperado, encontrado): {errors}")
+
+
+def run_render(command, check, cwd, context, inputs):
+    graph = command[command.index("-filter_complex") + 1] if "-filter_complex" in command else ""
+    LOGGER.info("%s | diretório=%s | FFmpeg=%s | filter_complex=%s | entradas=%s",
+                context, cwd, json.dumps(command, ensure_ascii=False), graph, inputs)
+    try:
+        run(command, check, cwd=cwd)
+    except CommandError as error:
+        LOGGER.error("%s | erro completo do FFmpeg:\n%s", context, error.stderr)
+        raise
+
+
+def normalize_video(width, height, pixel_format, *, enforce_fps=False):
+    # fps sets both the frame rate and the 1/FPS time base expected by xfade.
+    timing = (f"setpts=PTS-STARTPTS,fps={FPS}:start_time=0:eof_action=pass"
+              if enforce_fps else f"settb=1/{FPS},setpts=N")
+    return f"scale={width}:{height}:out_range=tv,setsar=1,format={pixel_format},{timing}"
+
+
+def encode_scene(scratch, sources, local_cues, words, plan, moment, index, settings, attempt, check):
+    draft = settings.get("draft", False)
+    width, height = (540, 960) if draft else (WIDTH, HEIGHT)
+    strength = settings["intensity"] / 100
+    mode = settings["edit_mode"]
+    context = (f"Cena {index + 1} | tentativa={attempt} | câmera={plan['camera']} | "
+               f"entrada={plan['entrance']} | saída={plan['exit']} | transição={plan['transition']} | "
+               f"rotação={plan['rotation']}")
+    metadata = {}
+    for kind, path in sources.items():
+        try:
+            stream = video_stream(path, check)
+        except (CommandError, OSError, ValueError) as error:
+            LOGGER.error("%s | FFprobe da entrada %s (%s): %s", context, kind, path,
+                         error.stderr if isinstance(error, CommandError) else error)
+            raise
+        metadata[kind] = {"arquivo": str(path), "resolução": f"{stream['width']}x{stream['height']}",
+                          "pix_fmt": stream["pix_fmt"]}
+    (scratch / "cena.ass").write_text(
+        ass(local_cues, plan["highlight"] if mode != "Leve" and strength else "",
+            strength if mode != "Leve" else 0, words), encoding="utf-8")
+    compose_file(sources["image"], scratch / "frame.jpg", width, height)
+    inputs = ["-framerate", str(FPS), "-i", "frame.jpg"]
+    # A larger input reduces integer-position jitter in zoompan.
+    camera = camera_filter(width, height, index, plan, moment, strength)
+    chain = [f"[0:v]scale={width*2}:{height*2}:out_range=tv,setsar=1,format=yuv444p,{camera},"
+             f"setsar=1,settb=1/{FPS},setpts=N[base]"]
+    current = "base"
+    input_index = 1
+    if "video" in sources:
+        inputs += ["-stream_loop", "-1", "-i", str(sources["video"].resolve())]
+        video_camera = camera_filter(width, height, index, plan, moment, strength, True)
+        chain += [
+            f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},setsar=1,fps={FPS},format=yuv444p,{video_camera},"
+            f"setsar=1,settb=1/{FPS},setpts=N,format=rgba,"
+            f"fade=t=in:st={moment:.4f}:d=0.15:alpha=1[video]",
+            f"[base][video]overlay=enable='gte(t,{moment:.4f})':format=rgb:alpha=straight[broll]",
+        ]
+        current = "broll"
+        input_index += 1
+    if "graphic" in sources:
+        graphic_file(sources["graphic"], scratch / "graphic.png", width)
+        inputs += ["-framerate", str(FPS), "-i", "graphic.png"]
+        alpha, position = overlay_filters(width, plan, moment, strength)
+        chain += [f"[{input_index}:v]{alpha}[graphic]", f"[{current}][graphic]{position}[combined]"]
+        current = "combined"
+        input_index += 1
+    if "next" in sources:
+        compose_file(sources["next"], scratch / "next.jpg", width, height)
+        inputs += ["-loop", "1", "-framerate", str(FPS), "-i", "next.jpg"]
+        kind = TRANSITIONS[plan["transition"]]
+        duration = round(FPS * (.18 + .14 * strength)) / FPS
+        whip = ",avgblur=sizeX=13:sizeY=1" if plan["transition"] == "whip" else ""
+        outgoing_blur = (f",avgblur=sizeX=13:sizeY=1:enable='gte(t,{SCENE_SECONDS-duration:.6f})'"
+                         if whip else "")
+        transition_input = normalize_video(width, height, "yuv444p", enforce_fps=True)
+        chain += [f"[{input_index}:v]{transition_input}{whip}[next]",
+                  f"[{current}]{transition_input}{outgoing_blur}[previous]",
+                  f"[previous][next]xfade=transition={kind}:duration={duration:.6f}:"
+                  f"offset={SCENE_SECONDS-duration:.6f}[transition]"]
+        current = "transition"
+    # Relative paths keep libass filter escaping portable on Windows.
+    chain += [f"[{current}]{normalize_video(width, height, 'yuv420p')},"
+              "ass=filename=cena.ass:fontsdir=../fonts[out]"]
+    run_render(["ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_complex_threads", "2",
+                *inputs, "-filter_complex", ";".join(chain), "-map", "[out]", "-an",
+                "-frames:v", str(SCENE_FRAMES), "-r", str(FPS), "-fps_mode", "cfr",
+                "-color_range", "tv", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-threads", "2",
+                "-preset", "ultrafast" if draft or settings["light"] else "veryfast",
+                "-crf", "23" if settings["light"] else "20",
+                "-video_track_timescale", str(VIDEO_TIMESCALE), "clip.mp4"],
+               check, scratch, context, metadata)
+    validate_video(video_stream(scratch / "clip.mp4", check), width, height, SCENE_FRAMES)
+
 
 def scene_clip(staging, folder, scene, following, local_cues, plan, index, settings, check):
     draft = settings.get("draft", False)
-    width, height = ((540, 960) if draft else (WIDTH, HEIGHT))
-    strength = max(0, min(100, settings.get("intensity", 60))) / 100
-    mode = settings.get("edit_mode", "Leve")
-    video = scene.get("video") if plan["media"] == "video" and strength else None
-    graphic = scene.get("graphic") if strength and (mode != "Leve" or index % 4 == 0) else None
-    media = [folder / scene["image"]["file"]]
-    for item in (video, graphic, following):
-        if item:
-            media.append(folder / item["file"])
+    width, height = (540, 960) if draft else (WIDTH, HEIGHT)
+    settings = {**settings, "intensity": max(0, min(100, settings.get("intensity", 60))),
+                "edit_mode": settings.get("edit_mode", "Leve")}
+    strength = settings["intensity"]
+    sources = {"image": folder / scene["image"]["file"]}
+    if strength:
+        if plan["media"] == "video" and scene.get("video"):
+            sources["video"] = folder / scene["video"]["file"]
+        if scene.get("graphic") and (settings["edit_mode"] != "Leve" or index % 4 == 0):
+            sources["graphic"] = folder / scene["graphic"]["file"]
+        if following:
+            sources["next"] = folder / following["file"]
     words = scene.get("word_timings", [])
     digest = hashlib.sha256(json.dumps(
-        [7, index, width, strength, mode, settings["light"], local_cues, words, plan,
-         [file_digest(path) for path in media]], ensure_ascii=False, sort_keys=True
+        [8, index, width, strength, settings["edit_mode"], settings["light"], local_cues, words, plan,
+         {kind: file_digest(path) for kind, path in sources.items()}],
+        ensure_ascii=False, sort_keys=True
     ).encode("utf-8")).hexdigest()[:24]
     clip = staging / f"clip-{index:02d}-{digest}.mp4"
     if clip.is_file():
-        return clip
+        try:
+            validate_video(video_stream(clip, check), width, height, SCENE_FRAMES)
+        except (RuntimeError, OSError, ValueError) as error:
+            LOGGER.warning("Cena %d | cache inválido %s: %s", index + 1, clip, error)
+        else:
+            return clip
+    fonts = staging / "fonts"
+    fonts.mkdir(exist_ok=True)
+    if not (fonts / FONT.name).is_file():
+        shutil.copyfile(FONT, fonts / FONT.name)
     moment = event_moment(local_cues, plan, words)
-    with tempfile.TemporaryDirectory(prefix="cena-", dir=staging) as temporary:
-        scratch = Path(temporary)
-        (scratch / "cena.ass").write_text(
-            ass(local_cues, plan["highlight"] if mode != "Leve" and strength else "",
-                strength if mode != "Leve" else 0, words), encoding="utf-8")
-        compose_file(media[0], scratch / "frame.jpg", width, height)
-        inputs = ["-i", "frame.jpg"]
-        # A larger input reduces integer-position jitter in zoompan.
-        scale = f"scale={width*2}:{height*2}"
-        camera = camera_filter(width, height, index, plan, moment, strength)
-        chain = [f"[0:v]{scale},{camera},setsar=1,format=yuv420p[base]"]
-        current = "base"
-        input_index = 1
-        if video:
-            inputs += ["-stream_loop", "-1", "-i", str((folder / video["file"]).resolve())]
-            video_camera = camera_filter(width, height, index, plan, moment, strength, True)
-            chain += [
-                f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},fps=30,{video_camera},setsar=1,format=yuva420p,"
-                f"fade=t=in:st={moment:.4f}:d=0.15:alpha=1[video]",
-                f"[base][video]overlay=enable='gte(t,{moment:.4f})'[broll]"
-            ]
-            current = "broll"
-            input_index += 1
-        if graphic:
-            inputs += ["-loop", "1", "-framerate", "30", "-i", str((folder / graphic["file"]).resolve())]
-            alpha, position = overlay_filters(width, plan, moment, strength)
-            chain += [f"[{input_index}:v]{alpha}[graphic]", f"[{current}][graphic]{position}[combined]"]
-            current = "combined"
-            input_index += 1
-        if following and strength:
-            compose_file(folder / following["file"], scratch / "next.jpg", width, height)
-            inputs += ["-loop", "1", "-framerate", "30", "-i", "next.jpg"]
-            kind = TRANSITIONS[plan["transition"]]
-            duration = round(30 * (.18 + .14 * strength)) / 30
-            whip = ",avgblur=sizeX=13:sizeY=1" if plan["transition"] == "whip" else ""
-            outgoing_blur = (f",avgblur=sizeX=13:sizeY=1:enable='gte(t,{5-duration:.6f})'"
-                             if whip else "")
-            chain += [f"[{input_index}:v]setsar=1,format=yuv420p,settb=1/30{whip}[next]",
-                      f"[{current}]fps=30,format=yuv420p,settb=1/30{outgoing_blur}[previous]",
-                      f"[previous][next]xfade=transition={kind}:duration={duration:.6f}:"
-                      f"offset={5-duration:.6f}[transition]"]
-            current = "transition"
-        fonts = (staging / "fonts")
-        fonts.mkdir(exist_ok=True)
-        if not (fonts / FONT.name).is_file():
-            shutil.copyfile(FONT, fonts / FONT.name)
-        # Relative paths keep libass filter escaping portable on Windows.
-        chain += [f"[{current}]format=yuv420p,ass=filename=cena.ass:fontsdir=../fonts[out]"]
-        run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_complex_threads", "2",
-             *inputs, "-filter_complex", ";".join(chain), "-map", "[out]",
-             "-an", "-frames:v", "150", "-pix_fmt", "yuv420p", "-c:v", "libx264",
-             "-threads", "2", "-preset", "ultrafast" if draft or settings["light"] else "veryfast",
-             "-crf", "23" if settings["light"] else "20", "clip.mp4"], check, cwd=scratch)
-        (scratch / "clip.mp4").replace(clip)
-    return clip
+    simple = dict(plan, camera="ken-burns", entrance="fade", exit="fade", rotation=0,
+                  scale_from=plan["scale_to"], transition="crossfade")
+    attempts = (
+        ("original", plan, sources),
+        ("simplificada", simple, {kind: path for kind, path in sources.items() if kind != "video"}),
+        ("zoom suave", simple, {"image": sources["image"]}),
+    )
+    for attempt, effect, assets in attempts:
+        check()
+        with tempfile.TemporaryDirectory(prefix="cena-", dir=staging) as temporary:
+            scratch = Path(temporary)
+            try:
+                encode_scene(scratch, assets, local_cues, words, effect, moment, index, settings, attempt, check)
+            except (RuntimeError, OSError, ValueError) as error:
+                LOGGER.warning("Cena %d | tentativa=%s | efeito=%s | arquivos=%s | %s",
+                               index + 1, attempt, effect, assets, error)
+                if attempt == "zoom suave":
+                    raise
+            else:
+                (scratch / "clip.mp4").replace(clip)
+                return clip
+
 
 def animated_ass(cues_by_scene, plans, scenes, strength):
     output = []
     for index, (cues, plan, scene) in enumerate(zip(cues_by_scene, plans, scenes, strict=True)):
-        absolute = [(start + index*5, end + index*5, lines) for start, end, lines in cues]
-        words = [(start + index*5, word) for start, word in scene.get("word_timings", [])]
+        absolute = [(start + index*SCENE_SECONDS, end + index*SCENE_SECONDS, lines) for start, end, lines in cues]
+        words = [(start + index*SCENE_SECONDS, word) for start, word in scene.get("word_timings", [])]
         document = ass(absolute, plan["highlight"] if strength else "", strength, words)
         output.extend(document.splitlines() if index == 0 else
                       [row for row in document.splitlines() if row.startswith("Dialogue:")])
@@ -166,7 +278,7 @@ def render(project, folder, audios, timings, light, progress, check, *, settings
         if music:
             number = 4 if sfx else 3
             inputs += ["-stream_loop", "-1", "-i", str(Path(music).resolve())]
-            stages.append(f"[{number}:a]volume=0.10,atrim=duration={5*len(scenes)},aformat=channel_layouts=mono[music]")
+            stages.append(f"[{number}:a]volume=0.10,atrim=duration={SCENE_SECONDS*len(scenes)},aformat=channel_layouts=mono[music]")
             sources.append("[music]")
         if len(sources) == 2:
             stages.append("".join(sources) + "amix=inputs=2:duration=first:normalize=0[bed]")
@@ -181,22 +293,25 @@ def render(project, folder, audios, timings, light, progress, check, *, settings
     (staging / "legendas.ass").write_text(animated_ass(local_cues, plans, scenes, subtitle_strength), encoding="utf-8")
     progress(96, "Montando o MP4 e verificando a duração")
     target = staging / "video-pendente.mp4"
-    run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "1",
-         "-i", "video.txt", "-i", audio_path.name, "-i", "legendas.srt", *inputs,
-         "-map", "0:v:0", "-map", "[a]" if has_mix else "1:a:0", "-map", "2:s:0", "-c:v", "copy",
-         "-c:a", "aac", "-b:a", "160k", "-c:s", "mov_text", "-metadata:s:s:0", "language=por",
-         "-disposition:s:0", "0", "-movflags", "+faststart", target.name], check, cwd=staging)
+    run_render(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "1",
+                "-i", "video.txt", "-i", audio_path.name, "-i", "legendas.srt", *inputs,
+                "-map", "0:v:0", "-map", "[a]" if has_mix else "1:a:0", "-map", "2:s:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-c:s", "mov_text",
+                "-metadata:s:s:0", "language=por", "-disposition:s:0", "0",
+                "-video_track_timescale", str(VIDEO_TIMESCALE), "-movflags", "+faststart", target.name],
+               check, staging, "Montagem do MP4", clips)
     streams = probe(target, check)["streams"]
     video = next(item for item in streams if item["codec_type"] == "video")
     audio = next(item for item in streams if item["codec_type"] == "audio")
-    duration = 5 * len(scenes)
+    duration = SCENE_SECONDS * len(scenes)
     if abs(float(audio["duration"]) - duration) > 1 / SAMPLE_RATE:
         raise RuntimeError(f"A faixa de áudio exportada precisa ter {duration} segundos.")
-    expected_size = (540, 960) if settings.get("draft") else (WIDTH, HEIGHT)
-    if (video["width"], video["height"], video["avg_frame_rate"],
-            int(video["nb_frames"]), float(video["duration"])) != (
-            *expected_size, "30/1", duration * FPS, float(duration)):
-        raise RuntimeError(f"O vídeo exportado não atende ao formato de {duration} s a 30 FPS.")
+    width, height = (540, 960) if settings.get("draft") else (WIDTH, HEIGHT)
+    try:
+        validate_video(video, width, height, len(scenes) * SCENE_FRAMES)
+    except RuntimeError as error:
+        LOGGER.error("Montagem do MP4 | %s", error)
+        raise
     target.replace(staging / "video.mp4")
     return staging
 
