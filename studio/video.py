@@ -6,9 +6,10 @@ import tempfile
 import wave
 from pathlib import Path
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageOps, ImageStat
 
 from .captions import FONT, ass, scene_cues, srt
+from .images import generic_graphic, image_info, placeholder
 from .motion import (FPS, GRAPHIC_MIN_SCALE, MODES, SCENE_FRAMES, TRANSITIONS, align_plan,
                      camera_filter, event_moment, graphic_canvas_size, overlay_filters, plans_for)
 from .sound import track
@@ -21,14 +22,22 @@ LOGGER = logging.getLogger(__name__)
 
 def compose(original, width=WIDTH, height=HEIGHT):
     source = ImageOps.exif_transpose(original).convert("RGB")
-    if abs(source.width / source.height - width / height) <= 0.10:
+    ratio = width / height
+    if source.width / source.height <= ratio:
         return ImageOps.fit(source, (width, height), Image.Resampling.LANCZOS)
-    backdrop = ImageOps.fit(source, (width // 4, height // 4))
-    backdrop = backdrop.filter(ImageFilter.GaussianBlur(14)).resize((width, height))
-    backdrop = ImageEnhance.Brightness(backdrop).enhance(0.62)
-    foreground = ImageOps.contain(source, (round(width*.86), round(height*.87)), Image.Resampling.LANCZOS)
-    backdrop.paste(foreground, ((width - foreground.width) // 2, (height - foreground.height) // 2))
-    return backdrop
+    reduced = source.convert("L")
+    reduced.thumbnail((320, 320))
+    span = max(1, round(reduced.height * ratio))
+    available = reduced.width - span
+    positions = (.5, .35, .65, .2, .8)
+    # Favor visual detail without always placing a building at the edge of frame.
+    def interest(position):
+        left = round(available * position)
+        crop = reduced.crop((left, 0, left + span, reduced.height))
+        return ImageStat.Stat(crop).stddev[0] - abs(position - .5) * 20
+
+    return ImageOps.fit(source, (width, height), Image.Resampling.LANCZOS,
+                        centering=(max(positions, key=interest), .5))
 
 def compose_file(source, output, width, height):
     with Image.open(source) as original:
@@ -110,7 +119,7 @@ def encode_scene(scratch, sources, local_cues, words, plan, moment, index, setti
         metadata[kind] = {"arquivo": str(path), "resolução": f"{stream['width']}x{stream['height']}",
                           "pix_fmt": stream["pix_fmt"]}
     (scratch / "cena.ass").write_text(
-        ass(local_cues, plan["highlight"] if mode != "Leve" and strength else "",
+        ass(local_cues, plan["highlight"],
             strength if mode != "Leve" else 0, words), encoding="utf-8")
     compose_file(sources["image"], scratch / "frame.jpg", width, height)
     inputs = ["-framerate", str(FPS), "-i", "frame.jpg"]
@@ -131,6 +140,15 @@ def encode_scene(scratch, sources, local_cues, words, plan, moment, index, setti
             f"[base][video]overlay=enable='gte(t,{moment:.4f})':format=rgb:alpha=straight[broll]",
         ]
         current = "broll"
+        input_index += 1
+    if "secondary" in sources:
+        compose_file(sources["secondary"], scratch / "additional.jpg", width, height)
+        inputs += ["-framerate", str(FPS), "-i", "additional.jpg"]
+        move = camera_filter(width, height, index + 1, {"camera": "ken-burns"}, moment, strength)
+        chain += [f"[{input_index}:v]scale={width*2}:{height*2}:out_range=tv,setsar=1,format=yuv444p,"
+                  f"{move},setsar=1,format=rgba,fade=t=in:st=2.45:d=0.32:alpha=1[additional]",
+                  f"[{current}][additional]overlay=enable='gte(t,2.45)':format=rgb:alpha=straight[twoimages]"]
+        current = "twoimages"
         input_index += 1
     if "graphic" in sources:
         graphic_file(sources["graphic"], scratch / "graphic.png", width)
@@ -173,17 +191,25 @@ def scene_clip(staging, folder, scene, following, local_cues, plan, index, setti
     settings = {**settings, "intensity": max(0, min(100, settings.get("intensity", 60))),
                 "edit_mode": settings.get("edit_mode", "Leve")}
     strength = settings["intensity"]
-    sources = {"image": folder / scene["image"]["file"]}
+    base = scene.get("image", {})
+    if not base.get("file") or placeholder(base):
+        raise ValueError(f"Selecione uma imagem válida para a cena {index + 1:02d}.")
+    sources = {"image": folder / base["file"]}
+    image_info(sources["image"])
+    additional = scene.get("secondary_image", {})
+    if additional and not placeholder(additional):
+        sources["secondary"] = folder / additional["file"]
     if strength:
-        if plan["media"] == "video" and scene.get("video"):
+        if plan["media"] == "video" and scene.get("video") and not additional:
             sources["video"] = folder / scene["video"]["file"]
-        if scene.get("graphic") and (settings["edit_mode"] != "Leve" or index % 4 == 0):
+        if (scene.get("graphic") and not generic_graphic(scene["graphic"])
+                and (settings["edit_mode"] != "Leve" or index % 4 == 0)):
             sources["graphic"] = folder / scene["graphic"]["file"]
-        if following:
+        if following and not placeholder(following):
             sources["next"] = folder / following["file"]
     words = scene.get("word_timings", [])
     digest = hashlib.sha256(json.dumps(
-        [8, index, width, strength, settings["edit_mode"], settings["light"], local_cues, words, plan,
+        [9, index, width, strength, settings["edit_mode"], settings["light"], local_cues, words, plan,
          {kind: file_digest(path) for kind, path in sources.items()}],
         ensure_ascii=False, sort_keys=True
     ).encode("utf-8")).hexdigest()[:24]
@@ -194,6 +220,7 @@ def scene_clip(staging, folder, scene, following, local_cues, plan, index, setti
         except (RuntimeError, OSError, ValueError) as error:
             LOGGER.warning("Cena %d | cache inválido %s: %s", index + 1, clip, error)
         else:
+            LOGGER.info("Cena %d | clipe validado do cache=%s | entradas=%s", index + 1, clip, sources)
             return clip
     fonts = staging / "fonts"
     fonts.mkdir(exist_ok=True)
@@ -204,7 +231,7 @@ def scene_clip(staging, folder, scene, following, local_cues, plan, index, setti
                   scale_from=plan["scale_to"], transition="crossfade")
     attempts = (
         ("original", plan, sources),
-        ("simplificada", simple, {kind: path for kind, path in sources.items() if kind != "video"}),
+        ("simplificada", simple, {kind: path for kind, path in sources.items() if kind not in {"video", "secondary"}}),
         ("zoom suave", simple, {"image": sources["image"]}),
     )
     for attempt, effect, assets in attempts:
@@ -228,7 +255,7 @@ def animated_ass(cues_by_scene, plans, scenes, strength):
     for index, (cues, plan, scene) in enumerate(zip(cues_by_scene, plans, scenes, strict=True)):
         absolute = [(start + index*SCENE_SECONDS, end + index*SCENE_SECONDS, lines) for start, end, lines in cues]
         words = [(start + index*SCENE_SECONDS, word) for start, word in scene.get("word_timings", [])]
-        document = ass(absolute, plan["highlight"] if strength else "", strength, words)
+        document = ass(absolute, plan["highlight"], strength, words)
         output.extend(document.splitlines() if index == 0 else
                       [row for row in document.splitlines() if row.startswith("Dialogue:")])
     return "\n".join(output) + "\n"
@@ -273,10 +300,10 @@ def render(project, folder, audios, timings, light, progress, check, *, settings
         if sfx:
             track(staging / "efeitos.wav", events, strength, folder / "cache-efeitos", check)
             inputs += ["-i", "efeitos.wav"]
-            stages.append("[3:a]volume=0.31[fx]")
+            stages.append("[2:a]volume=0.31[fx]")
             sources.append("[fx]")
         if music:
-            number = 4 if sfx else 3
+            number = 3 if sfx else 2
             inputs += ["-stream_loop", "-1", "-i", str(Path(music).resolve())]
             stages.append(f"[{number}:a]volume=0.10,atrim=duration={SCENE_SECONDS*len(scenes)},aformat=channel_layouts=mono[music]")
             sources.append("[music]")
@@ -294,10 +321,9 @@ def render(project, folder, audios, timings, light, progress, check, *, settings
     progress(96, "Montando o MP4 e verificando a duração")
     target = staging / "video-pendente.mp4"
     run_render(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "1",
-                "-i", "video.txt", "-i", audio_path.name, "-i", "legendas.srt", *inputs,
-                "-map", "0:v:0", "-map", "[a]" if has_mix else "1:a:0", "-map", "2:s:0",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-c:s", "mov_text",
-                "-metadata:s:s:0", "language=por", "-disposition:s:0", "0",
+                "-i", "video.txt", "-i", audio_path.name, *inputs,
+                "-map", "0:v:0", "-map", "[a]" if has_mix else "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
                 "-video_track_timescale", str(VIDEO_TIMESCALE), "-movflags", "+faststart", target.name],
                check, staging, "Montagem do MP4", clips)
     streams = probe(target, check)["streams"]
@@ -320,12 +346,15 @@ def credits(project, music=None):
     rows.extend(f'{source["title"]} — {source["url"]}' for source in project["sources"])
     rows.extend(["", "CRÉDITOS DE MÍDIA · edição visual aplicada"])
     for index, scene in enumerate(project["scenes"], 1):
-        for kind in ("image", "video", "graphic"):
+        for kind in ("image", "secondary_image", "video", "graphic"):
             record = scene.get(kind)
-            if record:
+            if record and not placeholder(record) and not generic_graphic(record):
                 rows.append(f'{index:02} · ' + " | ".join(filter(None, (
                     record.get("title"), record.get("author"), record.get("provider"),
                     record.get("license"), record.get("url"), record.get("license_url")))))
+    if any("CC BY-SA" in scene.get(kind, {}).get("license", "")
+           for scene in project["scenes"] for kind in ("image", "secondary_image", "graphic")):
+        rows.append("Mídias CC BY-SA foram recortadas ou animadas. As adaptações permanecem sob a licença vinculada de cada item.")
     rows.append("Efeitos sonoros sintetizados pelo aplicativo · CC0 · https://creativecommons.org/publicdomain/zero/1.0/")
     if music:
         rows.append(f"Música local · {Path(music).name}")

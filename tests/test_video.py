@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
-from studio.images import card
 from studio.motion import (CAMERAS, ENTRANCES, EXITS, SOUNDS, TRANSITIONS, default_plan,
                            graphic_canvas_size, overlay_filters)
 from studio.sound import track
@@ -44,14 +43,21 @@ class VideoTests(unittest.TestCase):
                  "graphic": {"file": ("wide-alpha.png", "tall-alpha.png")[index % 2]}}
                 for index in range(14)
             ]
-            with self.assertNoLogs("studio.video", level="WARNING"):
+            Image.new("RGB", (637, 543), "#b77227").save(folder / "alternate.jpg")
+            scenes[0]["secondary_image"] = {"file": "alternate.jpg"}
+            scenes[1]["graphic"].update(provider="Gerado localmente")
+            with self.assertLogs("studio.video", level="INFO") as logs:
                 out = render({"scenes": scenes}, folder, [audio_path] * 14, [4.35] * 14,
                              True, lambda *_: None, CHECK,
                              settings={"edit_mode": "Viral", "intensity": 80})
+            self.assertFalse(any("WARNING:" in entry or "ERROR:" in entry for entry in logs.output))
+            self.assertTrue(any("additional.jpg" in entry for entry in logs.output))
+            scene_two = next(entry for entry in logs.output if "Cena 2 | tentativa=original" in entry)
+            self.assertNotIn("graphic.png", scene_two)
             info = probe(out / "video.mp4", CHECK)
             self.assertEqual(float(info["format"]["duration"]), 70.0)
             self.assertEqual({stream["codec_type"] for stream in info["streams"]},
-                             {"video", "audio", "subtitle"})
+                             {"video", "audio"})
             self.assert_video(out / "video.mp4", (1080, 1920), 2100)
             durations = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                              "-show_entries", "packet=duration", "-of", "csv=p=0",
@@ -63,21 +69,18 @@ class VideoTests(unittest.TestCase):
                 self.assert_video(clip, (1080, 1920), 150)
 
     def test_animated_preview_with_graphic_audio_and_accents(self):
-        from studio.decoration import local_graphic
-
         with tempfile.TemporaryDirectory() as root:
             folder = Path(root)
-            card(folder / "cena.jpg", 1)
+            make_media(folder)
             text = "A água congela? Açúcar também afeta a solução."
-            local_graphic(folder / "elemento.png", "Água", 1)
             audio_path = folder / "audio.wav"
             with wave.open(str(audio_path), "wb") as audio:
                 audio.setparams((1, 2, SAMPLE_RATE, 0, "NONE", "not compressed"))
                 audio.writeframes(bytes(SCENE_SAMPLES*2))
             plan = default_plan(0, text, [], "Viral")
             plan.update(camera="shake", entrance="triumph", sound="impact")
-            scene = {"text": text, "edit": plan, "image": {"file": "cena.jpg"},
-                     "graphic": {"file": "elemento.png"}}
+            scene = {"text": text, "edit": plan, "image": {"file": "wide.jpg"},
+                     "graphic": {"file": "wide-alpha.png"}}
             check = lambda: None
             out = render({"scenes": [scene]}, folder, [audio_path], [4.6], True,
                          lambda *args: None, check,
@@ -190,3 +193,12 @@ class VideoTests(unittest.TestCase):
                 for name in names:
                     with self.subTest(sound=name):
                         self.assertTrue(any(audio.readframes(SCENE_SAMPLES)))
+
+    def test_final_output_rejects_legacy_typography_card(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root)
+            Image.new("RGB", (720, 1280), "#552266").save(folder / "ilustracao-01.jpg")
+            scene = {"image": {"file": "ilustracao-01.jpg", "generated": True}, "text": TEXT}
+            with self.assertRaisesRegex(ValueError, "cena 01"):
+                scene_clip(folder, folder, scene, None, [], default_plan(0, TEXT, [], "Viral"),
+                           0, {"light": True}, CHECK)

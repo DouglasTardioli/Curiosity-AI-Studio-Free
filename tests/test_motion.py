@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from studio.captions import ass
-from studio.decoration import local_graphic, transparent
+from studio.decoration import transparent
 from studio.motion import default_plan, event_moment, plans_for, validate_plan
 
 class MotionTests(unittest.TestCase):
@@ -34,7 +34,9 @@ class MotionTests(unittest.TestCase):
             fake.save(path)
             with self.assertRaises(ValueError):
                 transparent(path)
-            local_graphic(path, "Açúcar e água", 0)
+            graphic = Image.new("RGBA", (192, 192))
+            ImageDraw.Draw(graphic).ellipse((24, 24, 168, 168), fill=(246, 95, 20, 220))
+            graphic.save(path)
             self.assertEqual(transparent(path).getpixel((0, 0))[3], 0)
 
     def test_real_word_boundary_wins_over_estimate(self):
@@ -45,9 +47,9 @@ class MotionTests(unittest.TestCase):
         self.assertIn(r"\t(1150,1220,\c&H0054E4FF&)", document)
         self.assertIn("água", document)
 
-    def test_missing_remote_images_are_replaced_without_user_input(self):
+    def test_no_placeholder_is_created_on_network_failure(self):
         from unittest.mock import Mock, patch
-        from studio.pipeline import images_ready, prepare_images
+        from studio.pipeline import missing_images, prepare_images
         from studio.store import Store
 
         with tempfile.TemporaryDirectory() as directory:
@@ -56,8 +58,8 @@ class MotionTests(unittest.TestCase):
             project["scenes"] = [{"text": f"Água e gelo na cena {index}", "keywords": ["water ice"]}
                                  for index in range(14)]
             folder = store.folder(project)
-            with patch("studio.pipeline.acquire", return_value={"file": "missing.jpg", "placeholder": True}):
+            with patch("studio.pipeline.acquire", return_value=None):
                 prepare_images(Mock(), store, project, {}, folder, lambda *_: None, lambda: None)
-            self.assertTrue(images_ready(project, folder))
-            self.assertEqual(len({scene["image"]["file"] for scene in project["scenes"]}), 14)
-            self.assertTrue(all(scene["image"]["license"] == "CC0" for scene in project["scenes"]))
+            self.assertEqual(missing_images(project, folder), list(range(1, 15)))
+            self.assertTrue(all("image" not in scene for scene in project["scenes"]))
+            self.assertFalse(list(folder.glob("*.jpg")))

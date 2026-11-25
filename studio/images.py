@@ -2,6 +2,7 @@ import hashlib
 import html
 import io
 import json
+import logging
 import shutil
 import unicodedata
 import re
@@ -12,11 +13,15 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse, urlsplit, urlunsplit
 
 import requests
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageOps
 
 from .research import session
 from .script import STRING, object_schema, request_json, scene_array
 
+LOGGER = logging.getLogger(__name__)
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
+IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "TIFF"}
+MIN_EDGE = 300
 COMMONS = "https://commons.wikimedia.org/w/api.php"
 
 def clean(value):
@@ -24,11 +29,15 @@ def clean(value):
 
 def get(client, url, **kwargs):
     response = client.get(url, timeout=(5, 25), **kwargs)
+    LOGGER.info("Consulta HTTP %s | %s", response.status_code, url)
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+    if "error" in data:
+        raise ValueError(data["error"].get("code", "Erro do provedor"))
+    return data
 
 def commons(client, query, *, graphics=False):
-    suffix = " filetype:drawing" if graphics else " filetype:bitmap"
+    suffix = "" if graphics else " filetype:bitmap"
     extensions = r"\.(?:svg|png)$" if graphics else r"\.(?:jpe?g|png|webp|tiff?)$"
     data = get(client, COMMONS, params={
         "action": "query", "generator": "search", "gsrsearch": query + suffix,
@@ -44,17 +53,81 @@ def commons(client, query, *, graphics=False):
             license_url = meta.get("LicenseUrl", "")
             author = clean(meta.get("Artist", ""))
             if meta.get("Restrictions", "").strip():
+                LOGGER.info("Commons rejeitou %s | restrições de reutilização", info["descriptionurl"])
                 continue
             if not (license_name in {"CC0", "Public domain"} or
-                    (re.fullmatch(r"CC BY [1-4]\.0", license_name) and author
+                    (re.fullmatch(r"CC BY(?:-SA)? (?:[1-4]\.0|2\.5)", license_name) and author
                      and urlparse(license_url).hostname == "creativecommons.org")):
+                LOGGER.info("Commons rejeitou %s | licença=%s ou atribuição incompleta",
+                            info["descriptionurl"], license_name)
                 continue
-            yield {"asset": info.get("thumburl") or info["url"], "url": info["descriptionurl"],
+            yield {"asset": info.get("thumburl") or info["url"], "original_asset": info["url"],
+                   "url": info["descriptionurl"],
                    "title": page["title"], "author": author, "license": license_name,
                    "tags": clean(meta.get("ImageDescription", ""))[:1000],
                    "width": info.get("thumbwidth", info.get("width", 0)),
                    "height": info.get("thumbheight", info.get("height", 0)),
                    "license_url": license_url, "provider": "Wikimedia Commons"}
+
+def openverse(client, query, *, graphics=False):
+    params = {"q": query, "license": "cc0,pdm,by,by-sa", "page_size": 15}
+    if graphics:
+        params["extension"] = "png"
+    data = get(client, "https://api.openverse.org/v1/images/", params=params)
+    licenses = {"cc0": "CC0", "pdm": "Public domain", "by": "CC BY", "by-sa": "CC BY-SA"}
+    for item in data.get("results", []):
+        code = item.get("license")
+        url = item.get("foreign_landing_url") or item.get("url")
+        license_url = item.get("license_url") or ""
+        if (not url or not item.get("url") or code not in licenses
+                or urlparse(license_url).hostname != "creativecommons.org"
+                or (code in {"by", "by-sa"} and not item.get("creator"))):
+            LOGGER.info("Openverse rejeitou %s | licença, URL ou atribuição incompleta", url)
+            continue
+        yield {"asset": item["url"], "url": url, "title": item.get("title") or "",
+               "author": item.get("creator") or "", "provider": "Openverse", "license": licenses[code],
+               "license_url": license_url, "width": item.get("width") or 0, "height": item.get("height") or 0,
+               "tags": " ".join(tag.get("name", "") for tag in item.get("tags") or [])}
+
+
+def validate_source(image):
+    if image.format not in IMAGE_FORMATS or min(image.size) < MIN_EDGE or image.width * image.height > 45_000_000:
+        raise ValueError(f"Formato ou resolução inválida: {image.format} {image.size}.")
+    image.load()
+
+
+def image_info(path):
+    with Image.open(path) as image:
+        validate_source(image)
+        return image.size
+
+
+def library_files(settings, query, extensions):
+    location = settings.get("media_library")
+    requested = terms(query)
+    if not location or not Path(location).is_dir() or not requested:
+        return []
+    try:
+        return sorted(path for path in Path(location).iterdir()
+                      if path.is_file() and path.suffix.lower() in extensions and terms(path.stem) & requested)
+    except OSError as error:
+        LOGGER.warning("Biblioteca local %s: %s", location, error)
+        return []
+
+
+def placeholder(record):
+    provider = record.get("provider")
+    name = Path(record.get("file", "")).name
+    return (record.get("placeholder") or record.get("generated") or provider == "Cartão gráfico"
+            or (record.get("title") or "").startswith("Ilustração tipográfica da cena")
+            or any(re.fullmatch(r"ilustracao-\d{2}-[a-f0-9]{12}\.jpg", filename, re.IGNORECASE)
+                   for filename in (name, record.get("title") or "")))
+
+
+def generic_graphic(record):
+    return (record.get("provider") == "Gerado localmente"
+            or record.get("title") == "Elemento vetorial rasterizado pelo aplicativo")
+
 
 def pexels(client, query, token):
     data = get(client, "https://api.pexels.com/v1/search", headers={"Authorization": token},
@@ -77,6 +150,7 @@ def pixabay(client, query, token):
 
 def normalize(source, target):
     with Image.open(source) as original:
+        validate_source(original)
         image = ImageOps.exif_transpose(original).convert("RGBA")
         image.thumbnail((1400, 2100))
         background = Image.new("RGB", image.size, "#111827")
@@ -85,8 +159,11 @@ def normalize(source, target):
         background.save(target, "JPEG", quality=92)
 
 def download(client, url, target, check=lambda: None):
+    if urlsplit(url).scheme not in {"http", "https"}:
+        raise ValueError("URL de imagem inválida.")
     payload = io.BytesIO()
-    with client.get(url, stream=True, timeout=(5, 25)) as response:
+    with client.get(url, stream=True, timeout=(4, 12)) as response:
+        LOGGER.info("Download HTTP %s | %s", response.status_code, url)
         response.raise_for_status()
         for chunk in response.iter_content(65536):
             check()
@@ -121,15 +198,6 @@ def comfy(client, settings, prompt, target, check):
         time.sleep(2)
     raise TimeoutError("O ComfyUI não retornou uma imagem no prazo.")
 
-def card(target, index):
-    image = Image.new("RGB", (720, 1280), "#101726")
-    draw = ImageDraw.Draw(image)
-    for radius in range(360, 30, -15):
-        color = (18 + index, 33 + (360-radius)//9, 53 + (360-radius)//5)
-        draw.ellipse((360-radius, 550-radius, 360+radius, 550+radius), outline=color, width=5)
-    draw.text((360, 550), "CURIOSITY", fill="#d7f7f4", anchor="mm", font_size=46)
-    image.save(target, "JPEG", quality=90)
-
 def generate_keywords(client, settings, project, check):
     schema = object_schema({"queries": scene_array({
         "type": "array", "items": STRING, "minItems": 4, "maxItems": 4,
@@ -137,11 +205,12 @@ def generate_keywords(client, settings, project, check):
     texts = [scene["text"] for scene in project["scenes"]]
     prompt = (
         "For each of the 14 Portuguese narration lines, produce four distinct English photo "
-        "search phrases (2 to 5 words each), in the same order. Start with the most specific "
+        "search phrases (3 to 7 words each), one group per scene in order. Start with the most specific "
         "visible subject. The other three should depict different concrete objects or activities "
-        "mentioned or implied by that line. Avoid unrelated stock images, abstract terms, "
+        "mentioned or implied by that line. Include visual context from the topic where needed and "
+        "avoid unrelated stock images, abstract terms, "
         "and repeating the same subject in every scene. Use plain English.\n"
-        f"Topic: {project['topic']}\nLines: {json.dumps(texts, ensure_ascii=False)}"
+        f"Topic (infer the subject from the lines when unspecified): {project['topic']}\nLines: {json.dumps(texts, ensure_ascii=False)}"
     )
     queries = request_json(client, settings, prompt, schema, 1000, check)["queries"]
     if not isinstance(queries, list) or len(queries) != len(texts):
@@ -190,14 +259,16 @@ def duplicate(candidate, used):
 def terms(value):
     plain = unicodedata.normalize("NFKD", value.lower())
     plain = "".join(char for char in plain if not unicodedata.combining(char))
-    return {word.removesuffix("s") for word in re.findall(r"[a-z0-9]+", plain)
+    aliases = {"gizeh": "giza", "gizah": "giza", "gize": "giza", "piramide": "pyramid",
+               "egito": "egypt", "egipcio": "egyptian", "queops": "khufu", "cheops": "khufu"}
+    return {aliases.get(word.removesuffix("s"), word.removesuffix("s")) for word in re.findall(r"[a-z0-9]+", plain)
             if len(word) > 2 and word not in {"the", "and", "with", "for", "from", "photo", "image", "vertical"}}
 
 def relevance(candidate, query):
     requested = terms(query)
-    raw_title = candidate.get("title", "").removeprefix("File:")
+    raw_title = (candidate.get("title") or "").removeprefix("File:")
     title = terms(re.sub(r"\.[a-z0-9]+$", "", raw_title, flags=re.IGNORECASE))
-    tags = terms(candidate.get("tags", ""))
+    tags = terms(candidate.get("tags") or "")
     matches = requested & (title | tags)
     if len(matches) < min(2, len(requested)) or not matches:
         return 0
@@ -214,77 +285,147 @@ def quality(candidate):
 def cached_download(candidate, cache, check):
     asset = candidate["asset"]
     location = cache / (hashlib.sha256(asset.encode("utf-8")).hexdigest() + ".jpg")
+    if location.is_file():
+        try:
+            image_info(location)
+        except (ValueError, OSError, Image.DecompressionBombError) as error:
+            LOGGER.warning("Cache de imagem inválido | %s | %s", location, error)
+            location.unlink(missing_ok=True)
+        else:
+            check()
+            return location, fingerprints(location)
     if not location.is_file():
         temporary = location.with_suffix(f".{uuid.uuid4().hex}.tmp")
         try:
             with session() as client:
-                download(client, asset, temporary, check)
+                try:
+                    download(client, asset, temporary, check)
+                except requests.HTTPError as error:
+                    original = candidate.get("original_asset")
+                    if not original or canonical(original) == canonical(asset) or error.response.status_code not in {400, 404}:
+                        raise
+                    LOGGER.warning("Miniatura indisponível | %s | tentando a imagem original", asset)
+                    download(client, original, temporary, check)
             temporary.replace(location)
         finally:
             temporary.unlink(missing_ok=True)
     check()
-    with Image.open(location) as image:
-        if min(image.size) < 300:
-            raise ValueError("Imagem pequena demais para revisão.")
+    image_info(location)
+    LOGGER.info("Imagem validada no cache | %s | %s", asset, location)
     return location, fingerprints(location)
 
-def acquire(client, settings, folder, scene, index, used, check, *, cache=None, excluded=()):
-    target = folder / f"imagem-{index:02d}-{uuid.uuid4().hex[:8]}.jpg"
-    notes = []
-    if settings["comfy_enabled"] and not settings["light"]:
+def marked(candidate):
+    return bool(re.search(r"watermark|marca[- ]d[’' ]?[áa]gua|stock preview", (candidate.get("title") or "")
+                          + " " + (candidate.get("tags") or ""), re.IGNORECASE))
+
+
+def reverse_scan(candidate):
+    title = Path(candidate.get("title") or "").stem
+    return bool(re.search(r"[-—,(]\s*(?:back|verso|reverse)\s*(?:[-—,)]|$)", title, re.IGNORECASE))
+
+
+def request_failure(error):
+    response = getattr(error, "response", None)
+    return f"{type(error).__name__} HTTP {response.status_code}" if response is not None else type(error).__name__
+
+
+def provider_candidates(client, provider, args, queries, unavailable, check):
+    for query in queries:
+        check()
+        LOGGER.info("Busca | provedor=%s | consulta=%s", provider.__name__, query)
         try:
-            result = comfy(client, settings, scene["prompt"], target, check)
-            result.update(fingerprints(target))
-            if not duplicate(result, used):
-                return dict(result, file=target.name)
-            target.unlink()
-        except (ValueError, RuntimeError, OSError, requests.RequestException, KeyError) as error:
-            check()
-            notes.append(f"ComfyUI: {error}")
-    providers = [(commons, ())]
-    if settings["pexels"]:
-        providers.append((pexels, (settings["pexels"],)))
-    if settings["pixabay"]:
-        providers.append((pixabay, (settings["pixabay"],)))
+            yield query, list(provider(client, query, *args))
+        except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+            LOGGER.warning("Busca falhou | provedor=%s | consulta=%s | %s",
+                           provider.__name__, query, request_failure(error))
+            response = getattr(error, "response", None)
+            if (isinstance(error, (requests.ConnectionError, requests.Timeout))
+                    or (response is not None and response.status_code in {401, 403, 429})):
+                unavailable.add(provider.__name__)
+                return
+
+
+def acquire(client, settings, folder, scene, index, used, check, *, cache=None, excluded=(), optional=False,
+            unavailable=None):
+    target = folder / f"imagem-{index:02d}-{uuid.uuid4().hex[:8]}.jpg"
+    unavailable = unavailable if unavailable is not None else set()
+    providers = [(commons, ()), (openverse, ())]
+    for provider, name in ((pexels, "pexels"), (pixabay, "pixabay")):
+        if settings.get(name):
+            providers.append((provider, (settings[name],)))
     cache = cache or folder / "cache-imagens"
     cache.mkdir(parents=True, exist_ok=True)
-    queries = list(dict.fromkeys([*scene.get("keywords", []), scene["query"]]))
+    queries = list(dict.fromkeys(filter(None, [*scene.get("keywords", []), scene.get("query")])))
+    excluded = [*used, *excluded]
     seen = set()
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for query in filter(None, queries):
-            candidates = []
-            for provider, args in providers:
+        for provider, args in providers:
+            if provider.__name__ in unavailable:
+                continue
+            check()
+            for query, results in provider_candidates(client, provider, args, queries, unavailable, check):
                 check()
-                try:
-                    for candidate in provider(client, query, *args):
-                        candidate.update(asset_url=candidate["asset"], search_query=query)
-                        if (canonical(candidate["url"]) not in seen
-                                and not duplicate(candidate, used) and not duplicate(candidate, excluded)
-                                and relevance(candidate, query)):
-                            seen.add(canonical(candidate["url"]))
-                            candidates.append(candidate)
-                except (requests.RequestException, ValueError, KeyError):
-                    if provider.__name__ not in notes:
-                        notes.append(provider.__name__)
-            candidates.sort(key=lambda item: (
-                relevance(item, query)[0],
-                item.get("license") in {"Public domain", "CC0", "Pexels License", "Pixabay Content License"},
-                relevance(item, query)[1:], quality(item)), reverse=True)
-            for offset in range(0, min(9, len(candidates)), 3):
-                batch = candidates[offset:offset + 3]
-                futures = [pool.submit(cached_download, item, cache, check) for item in batch]
-                for candidate, future in zip(batch, futures):
-                    check()
-                    try:
-                        location, hashes = future.result()
-                    except (OSError, ValueError, requests.RequestException, Image.DecompressionBombError):
-                        continue
-                    candidate.update(hashes)
-                    if duplicate(candidate, used) or duplicate(candidate, excluded):
-                        continue
-                    shutil.copyfile(location, target)
-                    return dict(candidate, file=target.name, notes=notes)
-    card(target, index)
-    return {"file": target.name, "provider": "Cartão gráfico", "title": "Imagem relevante pendente",
-            "author": "Curiosity AI Studio Free", "url": "", "license": "Arte do aplicativo",
-            "placeholder": True, "notes": notes}
+                candidates = []
+                for candidate in results:
+                    candidate.update(asset_url=candidate["asset"], search_query=query)
+                    url = canonical(candidate["url"])
+                    if url in seen or duplicate(candidate, excluded):
+                        LOGGER.info("Imagem rejeitada | duplicada | %s", candidate["url"])
+                    elif marked(candidate):
+                        LOGGER.info("Imagem rejeitada | marca-d’água nos metadados | %s", candidate["url"])
+                    elif reverse_scan(candidate):
+                        LOGGER.info("Imagem rejeitada | verso de digitalização | %s", candidate["url"])
+                    elif not relevance(candidate, query):
+                        LOGGER.info("Imagem rejeitada | relevância insuficiente | %s | %s", query, candidate["url"])
+                    else:
+                        candidates.append(candidate)
+                        seen.add(url)
+                candidates.sort(key=lambda item: (relevance(item, query),
+                                item.get("license") in {"Public domain", "CC0"}, quality(item)), reverse=True)
+                for offset in range(0, min(6 if optional else 12, len(candidates)), 3):
+                    batch = candidates[offset:offset + 3]
+                    futures = [pool.submit(cached_download, item, cache, check) for item in batch]
+                    for candidate, future in zip(batch, futures):
+                        check()
+                        try:
+                            location, hashes = future.result()
+                        except (OSError, ValueError, requests.RequestException, Image.DecompressionBombError) as error:
+                            LOGGER.warning("Download rejeitado | %s | %s | %s", candidate["asset"],
+                                           request_failure(error), str(error) if isinstance(error, ValueError) else "")
+                            continue
+                        candidate.update(hashes)
+                        if duplicate(candidate, excluded):
+                            LOGGER.info("Imagem rejeitada | conteúdo duplicado | %s", candidate["asset"])
+                            continue
+                        shutil.copyfile(location, target)
+                        LOGGER.info("Imagem selecionada | cena=%02d | %s | %s", index, candidate["url"], target)
+                        return dict(candidate, file=target.name)
+    for query in queries:
+        for path in library_files(settings, query, IMAGE_EXTENSIONS):
+            result = {"provider": "Biblioteca local", "title": path.stem, "search_query": query}
+            if not relevance(result, query) or placeholder(result) or marked(result) or reverse_scan(result):
+                continue
+            check()
+            try:
+                normalize(path, target)
+                result.update(fingerprints(target))
+                if not duplicate(result, excluded):
+                    LOGGER.info("Imagem local selecionada | cena=%02d | %s | %s", index, path, target)
+                    return dict(result, file=target.name)
+            except (ValueError, OSError, Image.DecompressionBombError) as error:
+                LOGGER.warning("Imagem local rejeitada | %s | %s", path, error)
+            target.unlink(missing_ok=True)
+    if not optional and settings.get("comfy_enabled") and not settings.get("light"):
+        try:
+            result = comfy(client, settings, scene["prompt"], target, check)
+            image_info(target)
+            result.update(fingerprints(target))
+            if not duplicate(result, excluded):
+                return dict(result, file=target.name)
+        except (ValueError, RuntimeError, OSError, requests.RequestException, KeyError) as error:
+            check()
+            LOGGER.warning("ComfyUI indisponível | cena=%02d | %s", index, request_failure(error))
+        target.unlink(missing_ok=True)
+    LOGGER.info("Imagem %s indisponível | cena=%02d | consultas=%s",
+                "adicional" if optional else "principal", index, queries)
+    return None

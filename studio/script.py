@@ -72,7 +72,7 @@ def approve_manual(project, text):
             scene = {"text": line, "query": string(line),
                      "prompt": f"Imagem vertical sem texto: {line}", "evidence": "", "source_id": ""}
         scenes.append(scene)
-    project.update(manual_script=text, manual_approved=True, scenes=scenes,
+    project.update(manual_script=text, manual_approved=True, media_review=False, scenes=scenes,
                    status="Roteiro aprovado")
 
 

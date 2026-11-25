@@ -1,7 +1,10 @@
+from random import Random
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+from PIL import Image, ImageDraw
 
 from studio.pipeline import process
 from studio.script import approve_manual, invalid_manual_lines, manual_lines
@@ -36,6 +39,17 @@ class ManualScriptTests(unittest.TestCase):
                 approve_manual(project, self.text)
                 store.save(project)
                 project = store.history()[0]
+                folder = store.folder(project)
+                for index, scene in enumerate(project["scenes"]):
+                    image = Image.new("RGB", (360, 340), "#2d573f")
+                    draw = ImageDraw.Draw(image)
+                    for x in range(8):
+                        for y in range(8):
+                            if Random(index * 64 + x * 8 + y).getrandbits(1):
+                                draw.rectangle((x * 45, y * 42, x * 45 + 20, y * 42 + 24), fill="white")
+                    name = f"imagem-{index}.jpg"
+                    image.save(folder / name)
+                    scene.update(image={"file": name}, image_status="Imagem válida")
                 with patch("studio.pipeline.binary", return_value=True), patch(
                     "studio.pipeline.run", return_value="\n".join(
                         f" T. {name} V->V" for name in
@@ -48,7 +62,13 @@ class ManualScriptTests(unittest.TestCase):
                 ) as render:
                     narrator.return_value.scene.return_value = "audio.wav", []
                     narrator.return_value.word_timings = []
+                    process(store, project, {"light": True}, "Renderizar", lambda *_: None, lambda: None)
+                    narrator.assert_not_called()
                     process(store, project, {"light": True}, "Vídeo", lambda *_: None, lambda: None)
+                    narrator.assert_not_called()
+                    self.assertEqual(project["status"], "Revisar cenas")
+                    self.assertTrue(project["media_review"])
+                    process(store, project, {"light": True}, "Renderizar", lambda *_: None, lambda: None)
                 generate.assert_not_called()
                 research.assert_not_called()
                 images.assert_called_once()
