@@ -6,11 +6,11 @@ import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, QSize, Qt, QStandardPaths, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap, QTextCursor, QTextFormat
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
@@ -19,8 +19,9 @@ from .motion import MODES
 from .images import duplicate, fingerprints, normalize
 from .pipeline import Interrupted, existing_image, export, process, retry_image
 from .research import CATEGORIES, session
-from .script import (MAX_HOOK, SCENE_COUNT, estimated_seconds, scene_counts,
-                     validate_scenes, word_range)
+from .script import (MAX_HOOK, SCENE_COUNT, STRICT_RANGE, approve_manual, estimated_seconds,
+                     invalid_manual_lines, manual_lines, scene_counts, scene_issues, validate_scenes,
+                     word_range, words)
 from .settings import defaults
 from .store import Store
 from .tools import binary
@@ -150,6 +151,9 @@ class Window(QMainWindow):
         page = self.page("Dashboard")
         page.addWidget(QLabel("Vídeo vertical · 70 s · 1080 × 1920 · 30 FPS", objectName="muted"))
         form = QFormLayout()
+        self.creation_mode = QComboBox()
+        self.creation_mode.addItems(["Gerar roteiro automaticamente com Ollama", "Inserir roteiro manualmente"])
+        form.addRow("Criação", self.creation_mode)
         self.category = QComboBox()
         self.category.addItems(CATEGORIES)
         self.topic = QLineEdit(placeholderText="Deixe em branco para escolher automaticamente")
@@ -160,6 +164,7 @@ class Window(QMainWindow):
         self.voice.currentIndexChanged.connect(
             lambda: self.settings.setValue("voice", self.voice.currentData()))
         form.addRow("Categoria", self.category)
+        self.category_label = form.labelForField(self.category)
         form.addRow("Assunto personalizado", self.topic)
         form.addRow("Voz", self.voice)
         self.edit_mode = QComboBox()
@@ -174,21 +179,134 @@ class Window(QMainWindow):
         self.auto_approved = QCheckBox("Renderizar após aprovar o roteiro")
         self.auto_approved.setChecked(self.settings.value("auto_approved", True, type=bool))
         self.auto_approved.toggled.connect(lambda value: self.settings.setValue("auto_approved", value))
-        form.addRow("Modo de edição", self.edit_mode)
-        form.addRow("Intensidade", self.intensity)
+        editing = QHBoxLayout()
+        editing.addWidget(self.edit_mode, 1)
+        editing.addWidget(QLabel("Intensidade"))
+        editing.addWidget(self.intensity)
+        form.addRow("Modo de edição", editing)
         form.addRow(self.auto_approved)
         page.addLayout(form)
         self.automatic = self.button("Gerar e renderizar vídeo", lambda: self.start_new("Vídeo"), page, True)
         self.script_only = self.button("Criar roteiro para revisar", lambda: self.start_new("Roteiro"), page)
-        page.addSpacing(14)
+        self.manual_panel = QWidget()
+        manual = QVBoxLayout(self.manual_panel)
+        manual.setContentsMargins(0, 0, 0, 0)
+        self.manual_text = QPlainTextEdit()
+        self.manual_text.setAccessibleName("Roteiro manual")
+        self.manual_text.setPlaceholderText("Cole ou digite uma linha de narração por cena.")
+        manual.addWidget(self.manual_text, 1)
+        self.manual_metrics = QLabel()
+        self.manual_metrics.setWordWrap(True)
+        manual.addWidget(self.manual_metrics)
+        actions = QHBoxLayout()
+        self.manual_import = self.button("Importar TXT", self.import_manual, actions)
+        self.manual_clear = self.button("Limpar", self.manual_text.clear, actions)
+        self.manual_save = self.button("Salvar roteiro", lambda: self.save_manual(), actions)
+        self.manual_approve = self.button("Aprovar e gerar vídeo", lambda: self.save_manual(approve=True),
+                                          actions, True)
+        manual.addLayout(actions)
+        page.addWidget(self.manual_panel, 1)
+        self.manual_text.textChanged.connect(self.update_manual_metrics)
+        self.creation_mode.currentIndexChanged.connect(self.update_creation_mode)
         self.current = QLabel()
         self.current.setWordWrap(True)
         self.current.setTextFormat(Qt.TextFormat.PlainText)
         page.addWidget(self.current)
-        self.resume = self.button("Renderizar projeto atual", self.resume_project, page)
-        self.stop = self.button("Interromper e salvar", self.stop_task, page)
-        self.export_button = self.button("Exportar MP4, SRT, ASS e créditos", self.export_project, page)
-        page.addStretch()
+        self.project_actions = QWidget()
+        buttons = QHBoxLayout(self.project_actions)
+        buttons.setContentsMargins(0, 0, 0, 0)
+        self.resume = self.button("Renderizar projeto atual", self.resume_project, buttons)
+        self.stop = self.button("Interromper e salvar", self.stop_task, buttons)
+        self.export_button = self.button("Exportar MP4, SRT, ASS e créditos", self.export_project, buttons)
+        self.new_manual = self.button("Novo roteiro", self.new_manual_project, buttons)
+        page.addWidget(self.project_actions)
+        self.dashboard_spacer = QWidget()
+        page.addWidget(self.dashboard_spacer, 1)
+        self.update_creation_mode()
+
+    def update_creation_mode(self):
+        manual = self.creation_mode.currentIndex() == 1
+        self.manual_panel.setVisible(manual)
+        self.dashboard_spacer.setVisible(not manual)
+        for widget in (self.automatic, self.script_only, self.auto_approved, self.category, self.category_label):
+            widget.setVisible(not manual)
+        if hasattr(self, "open_button"):
+            self.update_controls()
+        else:
+            self.update_manual_metrics()
+
+    def update_manual_metrics(self):
+        text = self.manual_text.toPlainText()
+        lines = manual_lines(text)
+        counts = [len(words(line)) for line in lines]
+        issues = scene_issues(counts)
+        invalid = invalid_manual_lines(counts)
+        lo, hi = STRICT_RANGE
+        self.manual_metrics.setText(
+            f"{len(lines)}/{SCENE_COUNT} linhas · {sum(counts)} palavras ({lo}–{hi}) · "
+            f"gancho {counts[0] if counts else 0}/{MAX_HOOK}"
+            + ("\n" + issues[0] if issues else "")
+            + (f" (+{len(issues) - 1})" if len(issues) > 1 else "")
+        )
+        selections = []
+        for index in invalid:
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = QTextCursor(self.manual_text.document().findBlockByNumber(index))
+            selection.format.setBackground(QColor("#682e39"))
+            selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            selections.append(selection)
+        self.manual_text.setExtraSelections(selections)
+        idle = self.thread is None
+        self.manual_approve.setEnabled(idle and not issues)
+        existing = bool(self.project and "manual_script" in self.project)
+        self.manual_save.setEnabled(idle and (bool(text) or existing))
+        self.manual_clear.setEnabled(idle and bool(text))
+
+    def import_manual(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Importar roteiro", filter="Texto UTF-8 (*.txt)")
+        if filename:
+            try:
+                self.manual_text.setPlainText(Path(filename).read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError) as error:
+                QMessageBox.warning(self, "Importar roteiro", f"Não foi possível ler o TXT em UTF-8. {error}")
+
+    def save_manual(self, approve=False):
+        if self.thread or not self.save_script():
+            return
+        text = self.manual_text.toPlainText()
+        existing = self.project and "manual_script" in self.project
+        topic = self.topic.text().strip() or "Roteiro manual"
+        project = copy.deepcopy(self.project) if existing else {
+            "scenes": [], "title": topic, "description": "", "hashtags": "",
+        }
+        try:
+            if project.get("manual_script") != text:
+                project.update(manual_script=text, manual_approved=False, status="Rascunho manual")
+            if approve:
+                approve_manual(project, text)
+            if existing:
+                self.store.save(project)
+            else:
+                project = self.store.new(topic, self.category.currentText(), **project)
+        except (ValueError, OSError) as error:
+            QMessageBox.warning(self, "Roteiro manual", str(error))
+            return
+        self.project = project
+        self.refresh()
+        if approve:
+            self.start_project("Vídeo")
+        else:
+            self.status.setText("Roteiro manual salvo no histórico.")
+
+    def new_manual_project(self):
+        if self.manual_text.toPlainText() != self.project["manual_script"]:
+            answer = QMessageBox.question(self, "Novo roteiro", "Descartar as alterações ainda não salvas?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.project = None
+        self.manual_text.clear()
+        self.topic.clear()
+        self.refresh()
 
     def editor(self):
         page = self.page("Editor de roteiro")
@@ -388,6 +506,11 @@ class Window(QMainWindow):
                 self.images.addItem(item)
             metadata = "\n".join(project.get(field, "") for field in ("title", "description", "hashtags"))
             self.sources.setPlainText(metadata.strip() + "\n\n" + "\n\n".join(sources))
+        manual = bool(project and "manual_script" in project)
+        self.editor_hint.setText(
+            "Edite e aprove o roteiro manual pelo Dashboard." if manual
+            else "Uma linha por cena. As fontes e os trechos registrados aparecem abaixo."
+        )
         review = project.get("script_review") if project else None
         self.review_hint.setText("Revise as cenas e confira as fontes antes de aprovar." if review else "")
         self.review_hint.setVisible(bool(review))
@@ -418,27 +541,40 @@ class Window(QMainWindow):
         idle = self.thread is None
         has_project = bool(self.project)
         has_scenes = has_project and bool(self.project["scenes"])
-        for widget in (self.automatic, self.script_only, self.save_settings_button, self.category,
+        manual = has_project and "manual_script" in self.project
+        pending_manual = manual and not self.project.get("manual_approved")
+        self.manual_text.setReadOnly(not idle)
+        self.update_manual_metrics()
+        for widget in (self.creation_mode, self.manual_import, self.automatic, self.script_only,
+                       self.save_settings_button, self.category,
                        self.topic, self.voice, self.edit_mode, self.intensity, self.auto_approved, *self.config_fields.values()):
             widget.setEnabled(idle)
         review = has_project and bool(self.project.get("script_review"))
-        self.resume.setEnabled(idle and has_project and not review)
+        self.resume.setEnabled(idle and has_project and not review and not pending_manual)
         self.approve_script_button.setVisible(review)
         self.approve_script_button.setEnabled(idle and review)
         self.stop.setEnabled(not idle and bool(self.work_id))
         self.export_button.setEnabled(idle and has_project and self.project["status"] == "Pronto")
-        self.save_script_button.setEnabled(idle and has_scenes)
-        self.script_text.setReadOnly(not (idle and has_scenes))
-        selected = idle and has_scenes and self.images.currentRow() >= 0
+        manual_mode = self.creation_mode.currentIndex() == 1
+        self.resume.setVisible(not manual_mode or (self.resume.isEnabled() and not self.export_button.isEnabled()))
+        self.stop.setVisible(not manual_mode or self.stop.isEnabled())
+        self.export_button.setVisible(not manual_mode or self.export_button.isEnabled())
+        self.new_manual.setVisible(manual_mode and manual and idle)
+        self.project_actions.setVisible(any(not button.isHidden() for button in (
+            self.resume, self.stop, self.export_button, self.new_manual,
+        )))
+        self.save_script_button.setEnabled(idle and has_scenes and not manual)
+        self.script_text.setReadOnly(not (idle and has_scenes and not manual))
+        selected = idle and has_scenes and not pending_manual and self.images.currentRow() >= 0
         self.replace.setEnabled(selected)
         self.retry.setEnabled(selected and not review)
-        self.render_button.setEnabled(idle and has_scenes and not review)
-        self.prepare_button.setEnabled(idle and has_scenes and not review)
-        self.preview_motion.setEnabled(idle and has_scenes and not review)
+        self.render_button.setEnabled(idle and has_scenes and not review and not pending_manual)
+        self.prepare_button.setEnabled(idle and has_scenes and not review and not pending_manual)
+        self.preview_motion.setEnabled(idle and has_scenes and not review and not pending_manual)
         self.open_button.setEnabled(idle and self.history.currentRow() >= 0)
 
     def save_script(self):
-        if not self.project or not self.script_text.document().isModified():
+        if not self.project or "manual_script" in self.project or not self.script_text.document().isModified():
             return True
         try:
             lines = self.editor_lines()
@@ -486,6 +622,7 @@ class Window(QMainWindow):
         if not self.save_script():
             return
         self.project = self.store.new(self.topic.text().strip(), self.category.currentText())
+        self.manual_text.clear()
         self.refresh()
         self.start_project(mode)
 
@@ -500,7 +637,16 @@ class Window(QMainWindow):
         if self.save_script():
             self.project = next(item for item in self.store.history() if item["id"] == selected)
             self.refresh()
-            self.nav.setCurrentRow(1 if self.project["scenes"] else 0)
+            if "manual_script" in self.project:
+                self.topic.setText("" if self.project["topic"] == "Roteiro manual" else self.project["topic"])
+                self.category.setCurrentText(self.project["category"])
+                self.manual_text.setPlainText(self.project["manual_script"])
+                self.creation_mode.setCurrentIndex(1)
+                self.nav.setCurrentRow(0)
+            else:
+                self.manual_text.clear()
+                self.creation_mode.setCurrentIndex(0)
+                self.nav.setCurrentRow(1 if self.project["scenes"] else 0)
 
     def find_image(self):
         row = self.images.currentRow()

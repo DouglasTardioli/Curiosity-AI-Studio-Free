@@ -14,9 +14,9 @@ class Store:
                 id TEXT PRIMARY KEY, updated TEXT DEFAULT CURRENT_TIMESTAMP, data TEXT NOT NULL
             )""")
 
-    def new(self, topic, category):
+    def new(self, topic, category, **fields):
         project = {"id": uuid.uuid4().hex, "topic": topic, "category": category,
-                   "sources": [], "scenes": [], "status": "Rascunho"}
+                   "sources": [], "scenes": [], "status": "Rascunho", **fields}
         self.save(project)
         return project
 

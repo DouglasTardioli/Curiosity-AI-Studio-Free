@@ -12,7 +12,7 @@ from .decoration import artwork, fallback_plate, video_asset
 from .motion import MODES, plans_for, predict
 from .images import acquire, duplicate, fingerprints, generate_keywords
 from .research import CATEGORIES, key, research, session
-from .script import generate, validate_scenes
+from .script import generate, manual_lines, validate_scenes
 from .tools import binary, run
 from .video import credits, render
 from .voice import SceneNarrator
@@ -23,11 +23,18 @@ class Interrupted(Exception):
     pass
 
 def process(store, project, settings, mode, progress, check):
+    manual = "manual_script" in project
+    if manual:
+        if not project.get("manual_approved"):
+            raise ValueError("Aprove o roteiro manual antes de gerar o vídeo.")
+        validate_scenes(project["scenes"])
+        if [scene["text"] for scene in project["scenes"]] != manual_lines(project["manual_script"]):
+            raise ValueError("O roteiro manual foi alterado. Aprove a versão atual antes de continuar.")
     folder = store.folder(project)
     previous_status = project["status"]
     try:
         with session() as client:
-            if not project["scenes"]:
+            if not manual and not project["scenes"]:
                 progress(4, "Pesquisando na Wikipédia")
                 history = [item for item in store.history() if item["id"] != project["id"]]
                 excluded = {item["sources"][0]["id"] for item in history if item["sources"]}
@@ -57,7 +64,8 @@ def process(store, project, settings, mode, progress, check):
             if mode == "Roteiro":
                 progress(100, "Roteiro salvo")
                 return
-            validate_scenes(project["scenes"], manual=True)
+            if not manual:
+                validate_scenes(project["scenes"], manual=True)
             if mode in ("Vídeo", "Renderizar", "Prévia"):
                 if not (binary("ffmpeg") and binary("ffprobe")):
                     raise RuntimeError("Instale FFmpeg e FFprobe e adicione ambos ao PATH.")
